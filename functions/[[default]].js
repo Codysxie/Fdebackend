@@ -455,10 +455,7 @@ async function onRequest(context) {
   const path = url.pathname;
   const method = request.method.toUpperCase();
 
-  // Ensure admin account exists on first cold start
-  await db.ensureDefaults();
-
-  // CORS preflight
+  // CORS preflight (before any DB work)
   if (method === 'OPTIONS') {
     return new Response(null, {
       status: 204,
@@ -471,13 +468,20 @@ async function onRequest(context) {
     });
   }
 
+  // Ensure admin account exists (non-fatal: log error but don't crash the request)
+  try {
+    await db.ensureDefaults();
+  } catch (seedErr) {
+    console.error('[Init] ensureDefaults failed (non-fatal):', seedErr.message);
+  }
+
   // API routes
   if (path.startsWith('/api/')) {
     try {
       return await handleAPI(path, method, request);
     } catch (err) {
-      console.error('[API Error]', err.message, err.stack);
-      return error('服务器内部错误: ' + err.message, 500);
+      console.error('[API Error]', err.message, err.stack || '');
+      return json({ error: '服务器内部错误: ' + err.message, detail: err.stack || '' }, 500);
     }
   }
 
