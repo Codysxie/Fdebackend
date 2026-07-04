@@ -97,20 +97,24 @@ export default async function onRequest(context) {
 
   async function supabaseREST(table, method, body, queryParts) {
     if (!SB_URL || !SB_KEY) return { error: 'Supabase not configured' };
-    var url = SB_URL + '/rest/v1/' + table + '?' + queryParts.join('&');
-    var headers = { 'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY, 'Content-Type': 'application/json' };
-    if (method !== 'GET') headers['Prefer'] = 'return=representation';
-    var opts = { method: method, headers: headers };
-    if (body) opts.body = JSON.stringify(body);
-    var resp = await fetch(url, opts);
-    var text = await resp.text();
-    if (resp.status >= 400) {
-      var err = text;
-      try { err = JSON.parse(text); } catch(e) {}
-      return { error: err, status: resp.status };
+    try {
+      var url = SB_URL + '/rest/v1/' + table + '?' + queryParts.join('&');
+      var headers = { 'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY, 'Content-Type': 'application/json' };
+      if (method !== 'GET') headers['Prefer'] = 'return=representation';
+      var opts = { method: method, headers: headers };
+      if (body) opts.body = JSON.stringify(body);
+      var resp = await fetch(url, opts);
+      var text = await resp.text();
+      if (resp.status >= 400) {
+        var err = text;
+        try { err = JSON.parse(text); } catch(e) {}
+        return { error: err, status: resp.status };
+      }
+      try { return { data: JSON.parse(text) }; }
+      catch(e) { return { data: text }; }
+    } catch(e) {
+      return { error: 'fetch failed: ' + (e.message || 'unknown error'), status: 0 };
     }
-    try { return { data: JSON.parse(text) }; }
-    catch(e) { return { data: text }; }
   }
 
   // ====== API handlers ======
@@ -129,6 +133,31 @@ export default async function onRequest(context) {
     return json({ envKeys: Object.keys(env), sbUrlLen: SB_URL.length, sbKeyLen: SB_KEY.length });
   }
 
+  // /api/diag — 诊断 Supabase 连接和表状态
+  if (path === '/api/diag' && method === 'GET') {
+    var diag = { sb_url: SB_URL, sb_key_prefix: SB_KEY.substring(0, 20) + '...' };
+
+    // Test 1: 检查 users 表是否存在并能否查询
+    var t1 = await supabaseREST('users', 'GET', null, ['select=count']);
+    diag.test_users_table = {
+      ok: !t1.error,
+      status: t1.status || (t1.error ? 'error' : 'ok'),
+      raw: t1.error || t1.data
+    };
+
+    // Test 2: 尝试直接获取所有表 (via PostgREST root)
+    try {
+      var rootResp = await fetch(SB_URL + '/rest/v1/', {
+        headers: { 'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY }
+      });
+      diag.test_rest_root = { status: rootResp.status, body: await rootResp.text() };
+    } catch(e) {
+      diag.test_rest_root = { error: e.message };
+    }
+
+    return json(diag);
+  }
+
   // /api/auth/login
   if (path === '/api/auth/login' && method === 'POST') {
     var body = await parseBody();
@@ -137,7 +166,10 @@ export default async function onRequest(context) {
     var h = hash(body.password);
     var qs = ['select=*', 'username=eq.' + encodeURIComponent(body.username)];
     var r = await supabaseREST('users', 'GET', null, qs.concat('limit=1'));
-    if (r.error) return json({ error: '查询用户失败', detail: r.error }, 500);
+    if (r.error) {
+      var sbMsg = typeof r.error === 'string' ? r.error : JSON.stringify(r.error);
+      return json({ error: '查询用户失败 - ' + sbMsg, detail: r.error }, 500);
+    }
 
     var users = Array.isArray(r.data) ? r.data : [r.data];
     if (users.length === 0 || users[0].password_hash !== h) {
@@ -158,7 +190,11 @@ export default async function onRequest(context) {
 
     // Check if user exists
     var check = await supabaseREST('users', 'GET', null, ['select=id', 'username=eq.' + encodeURIComponent(body.username), 'limit=1']);
-    if (!check.error && check.data && check.data.length > 0) return json({ error: '用户名已存在' }, 409);
+    if (check.error) {
+      var sbMsg2 = typeof check.error === 'string' ? check.error : JSON.stringify(check.error);
+      return json({ error: '检查用户名失败 - ' + sbMsg2, detail: check.error }, 500);
+    }
+    if (check.data && check.data.length > 0) return json({ error: '用户名已存在' }, 409);
 
     // Create user
     var cr = await supabaseREST('users', 'POST', {
@@ -169,7 +205,10 @@ export default async function onRequest(context) {
       created_at: now()
     }, ['select=*']);
 
-    if (cr.error) return json({ error: '注册失败', detail: cr.error }, 500);
+    if (cr.error) {
+      var sbMsg = typeof cr.error === 'string' ? cr.error : JSON.stringify(cr.error);
+      return json({ error: '注册失败 - ' + sbMsg, detail: cr.error }, 500);
+    }
 
     var user = Array.isArray(cr.data) ? cr.data[0] : cr.data;
     if (!user || !user.id) return json({ error: '注册失败，未获取到用户信息' }, 500);
