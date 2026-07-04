@@ -155,6 +155,76 @@ export default async function onRequest(context) {
     }
   }
 
+  // ====== Supabase Storage upload helper ======
+  async function uploadToStorage(fileBuffer, fileName, fileType) {
+    if (!SB_URL || !SB_KEY) return { error: 'Supabase not configured' };
+    var ext = (fileName || 'file.png').split('.').pop().toLowerCase();
+    var allowed = ['png', 'jpg', 'jpeg', 'gif', 'webp'];
+    if (allowed.indexOf(ext) < 0) return { error: '不支持的文件格式，请上传 PNG/JPG/JPEG/GIF/WebP' };
+    if (fileBuffer.byteLength > 5 * 1024 * 1024) return { error: '文件大小不能超过 5MB' };
+
+    var uniqueName = Date.now() + '-' + Math.round(Math.random() * 1e9) + '.' + ext;
+    var bucket = 'fde-uploads';
+
+    // Ensure bucket exists (ignore error if already exists)
+    try {
+      var bucketCheck = await fetch(SB_URL + '/storage/v1/bucket/' + bucket, {
+        headers: { 'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY }
+      });
+      if (bucketCheck.status === 404) {
+        await fetch(SB_URL + '/storage/v1/bucket', {
+          method: 'POST',
+          headers: {
+            'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            name: bucket, public: true,
+            file_size_limit: 5242880,
+            allowed_mime_types: ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
+          })
+        });
+      }
+    } catch(e) {}
+
+    // Upload file
+    var uploadUrl = SB_URL + '/storage/v1/object/' + bucket + '/' + uniqueName;
+    try {
+      var resp = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: {
+          'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY,
+          'Content-Type': fileType || 'application/octet-stream'
+        },
+        body: fileBuffer
+      });
+      if (resp.status >= 400) {
+        var errText = await resp.text();
+        return { error: '上传失败 ' + resp.status + ': ' + errText };
+      }
+    } catch(e) {
+      return { error: '上传失败: ' + (e.message || 'unknown') };
+    }
+
+    var publicUrl = SB_URL + '/storage/v1/object/public/' + bucket + '/' + uniqueName;
+    return { url: publicUrl, name: uniqueName };
+  }
+
+  // Delete old file from storage
+  async function deleteFromStorage(fileUrl) {
+    if (!fileUrl || !SB_URL || !SB_KEY) return;
+    var bucket = 'fde-uploads';
+    var idx = fileUrl.indexOf('/' + bucket + '/');
+    if (idx < 0) return;
+    var objPath = fileUrl.substring(idx + bucket.length + 2);
+    try {
+      await fetch(SB_URL + '/storage/v1/object/' + bucket + '/' + encodeURIComponent(objPath), {
+        method: 'DELETE',
+        headers: { 'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY }
+      });
+    } catch(e) {}
+  }
+
   // ====== Seed admin account ======
   // 首次访问自动创建管理员账号，避免空数据库无法登录
   var _seeded = false;
@@ -483,9 +553,24 @@ export default async function onRequest(context) {
     if (rev.error) return json({ error: '查询审批记录失败' }, 500);
     var revData = Array.isArray(rev.data) ? rev.data[0] : rev.data;
     if (!revData) return json({ error: '审批记录不存在' }, 404);
+
+    // Get current profile to detect changed files for cleanup
+    var oldPr = await supabaseREST('fde_profiles', 'GET', null, ['select=avatar_url,wechat_qr_url', 'user_id=eq.' + revData.user_id]);
+    var oldProfile = (!oldPr.error && oldPr.data && oldPr.data.length > 0)
+      ? (Array.isArray(oldPr.data) ? oldPr.data[0] : oldPr.data) : {};
+
     // Apply profile changes — copy pending profile_data into live fde_profiles
     var pd = revData.profile_data || {};
     var upPr = await supabaseREST('fde_profiles', 'PATCH', Object.assign({}, pd, { updated_at: now() }), ['user_id=eq.' + revData.user_id, 'select=*']);
+
+    // Cleanup old files if URLs changed
+    if (oldProfile.avatar_url && pd.avatar_url && oldProfile.avatar_url !== pd.avatar_url) {
+      await deleteFromStorage(oldProfile.avatar_url);
+    }
+    if (oldProfile.wechat_qr_url && pd.wechat_qr_url && oldProfile.wechat_qr_url !== pd.wechat_qr_url) {
+      await deleteFromStorage(oldProfile.wechat_qr_url);
+    }
+
     // Delete pending record
     await supabaseREST('pending_profiles', 'DELETE', null, ['id=eq.' + reviewId]);
     var profile = (!upPr.error && upPr.data && upPr.data.length > 0)
@@ -652,8 +737,60 @@ export default async function onRequest(context) {
     if (!auth) return json({ error: '请先登录' }, 401);
     var fdeUserId = parseInt(avatarMatch[1]);
     if (auth.role !== 'admin' && auth.id !== fdeUserId) return json({ error: '权限不足' }, 403);
-    // In edge functions we can't handle file uploads easily, return placeholder
-    return json({ error: 'Edge function 暂不支持文件上传，请使用 Supabase Storage 直传' }, 501);
+
+    var formData;
+    try { formData = await request.formData(); } catch(e) { return json({ error: '无效的请求格式，需要 multipart/form-data' }, 400); }
+    var file = formData.get('avatar');
+    if (!file || typeof file === 'string') return json({ error: '请上传图片' }, 400);
+
+    var arrayBuffer = await file.arrayBuffer();
+    var upload = await uploadToStorage(arrayBuffer, file.name, file.type);
+    if (upload.error) return json({ error: upload.error }, 400);
+
+    var url = upload.url;
+
+    // Admin: directly set avatar_url on live profile
+    if (auth.role === 'admin') {
+      // Delete old avatar
+      var oldProfile = await supabaseREST('fde_profiles', 'GET', null, ['select=avatar_url', 'user_id=eq.' + fdeUserId]);
+      if (!oldProfile.error && oldProfile.data && oldProfile.data.length > 0) {
+        var oldData = Array.isArray(oldProfile.data) ? oldProfile.data[0] : oldProfile.data;
+        if (oldData.avatar_url) await deleteFromStorage(oldData.avatar_url);
+      }
+      await supabaseREST('fde_profiles', 'PATCH', { avatar_url: url, updated_at: now() }, ['user_id=eq.' + fdeUserId]);
+      return json({ url: url, reviewed: true });
+    }
+
+    // Non-admin: submit to pending review
+    var cur = await supabaseREST('fde_profiles', 'GET', null, ['select=*', 'user_id=eq.' + fdeUserId]);
+    var currentProfile = (!cur.error && cur.data && cur.data.length > 0)
+      ? (Array.isArray(cur.data) ? cur.data[0] : cur.data) : {};
+
+    var existPend = await supabaseREST('pending_profiles', 'GET', null, ['select=*', 'user_id=eq.' + fdeUserId]);
+    var existingReview = (!existPend.error && existPend.data && existPend.data.length > 0)
+      ? (Array.isArray(existPend.data) ? existPend.data[0] : existPend.data) : null;
+
+    // Build profile_data from existing review or current profile, override avatar_url
+    function mval(key) {
+      if (existingReview && existingReview.profile_data && existingReview.profile_data[key] !== undefined)
+        return existingReview.profile_data[key];
+      if (currentProfile[key] !== undefined) return currentProfile[key];
+      return '';
+    }
+    var merged = {
+      name: mval('name'), title: mval('title'), city: mval('city'),
+      description: mval('description'), work_details: mval('work_details'),
+      resources_needed: mval('resources_needed'), skills: mval('skills'),
+      email: mval('email'), phone: mval('phone'),
+      avatar_url: url, wechat_qr_url: mval('wechat_qr_url')
+    };
+
+    if (existingReview) {
+      await supabaseREST('pending_profiles', 'PATCH', { profile_data: merged, created_at: now() }, ['user_id=eq.' + fdeUserId]);
+    } else {
+      await supabaseREST('pending_profiles', 'POST', { user_id: fdeUserId, profile_data: merged, created_at: now() });
+    }
+    return json({ url: url, reviewed: false, message: '头像已提交审核' });
   }
 
   // POST /api/fde/:userId/qrcode
@@ -663,7 +800,58 @@ export default async function onRequest(context) {
     if (!auth) return json({ error: '请先登录' }, 401);
     var fdeUserId = parseInt(qrMatch[1]);
     if (auth.role !== 'admin' && auth.id !== fdeUserId) return json({ error: '权限不足' }, 403);
-    return json({ error: 'Edge function 暂不支持文件上传，请使用 Supabase Storage 直传' }, 501);
+
+    var formData;
+    try { formData = await request.formData(); } catch(e) { return json({ error: '无效的请求格式，需要 multipart/form-data' }, 400); }
+    var file = formData.get('qrcode');
+    if (!file || typeof file === 'string') return json({ error: '请上传图片' }, 400);
+
+    var arrayBuffer = await file.arrayBuffer();
+    var upload = await uploadToStorage(arrayBuffer, file.name, file.type);
+    if (upload.error) return json({ error: upload.error }, 400);
+
+    var url = upload.url;
+
+    // Admin: directly set wechat_qr_url on live profile
+    if (auth.role === 'admin') {
+      var oldProfile = await supabaseREST('fde_profiles', 'GET', null, ['select=wechat_qr_url', 'user_id=eq.' + fdeUserId]);
+      if (!oldProfile.error && oldProfile.data && oldProfile.data.length > 0) {
+        var oldData = Array.isArray(oldProfile.data) ? oldProfile.data[0] : oldProfile.data;
+        if (oldData.wechat_qr_url) await deleteFromStorage(oldData.wechat_qr_url);
+      }
+      await supabaseREST('fde_profiles', 'PATCH', { wechat_qr_url: url, updated_at: now() }, ['user_id=eq.' + fdeUserId]);
+      return json({ url: url, reviewed: true });
+    }
+
+    // Non-admin: submit to pending review
+    var cur = await supabaseREST('fde_profiles', 'GET', null, ['select=*', 'user_id=eq.' + fdeUserId]);
+    var currentProfile = (!cur.error && cur.data && cur.data.length > 0)
+      ? (Array.isArray(cur.data) ? cur.data[0] : cur.data) : {};
+
+    var existPend = await supabaseREST('pending_profiles', 'GET', null, ['select=*', 'user_id=eq.' + fdeUserId]);
+    var existingReview = (!existPend.error && existPend.data && existPend.data.length > 0)
+      ? (Array.isArray(existPend.data) ? existPend.data[0] : existPend.data) : null;
+
+    function mval(key) {
+      if (existingReview && existingReview.profile_data && existingReview.profile_data[key] !== undefined)
+        return existingReview.profile_data[key];
+      if (currentProfile[key] !== undefined) return currentProfile[key];
+      return '';
+    }
+    var merged = {
+      name: mval('name'), title: mval('title'), city: mval('city'),
+      description: mval('description'), work_details: mval('work_details'),
+      resources_needed: mval('resources_needed'), skills: mval('skills'),
+      email: mval('email'), phone: mval('phone'),
+      avatar_url: mval('avatar_url'), wechat_qr_url: url
+    };
+
+    if (existingReview) {
+      await supabaseREST('pending_profiles', 'PATCH', { profile_data: merged, created_at: now() }, ['user_id=eq.' + fdeUserId]);
+    } else {
+      await supabaseREST('pending_profiles', 'POST', { user_id: fdeUserId, profile_data: merged, created_at: now() });
+    }
+    return json({ url: url, reviewed: false, message: '微信二维码已提交审核' });
   }
 
   // ====== Articles ======
@@ -784,7 +972,17 @@ export default async function onRequest(context) {
   if (path === '/api/articles/upload-cover' && method === 'POST') {
     var auth = getAuth();
     if (!auth) return json({ error: '请先登录' }, 401);
-    return json({ error: 'Edge function 暂不支持文件上传，请使用 Supabase Storage 直传' }, 501);
+
+    var formData;
+    try { formData = await request.formData(); } catch(e) { return json({ error: '无效的请求格式，需要 multipart/form-data' }, 400); }
+    var file = formData.get('cover');
+    if (!file || typeof file === 'string') return json({ error: '请上传图片' }, 400);
+
+    var arrayBuffer = await file.arrayBuffer();
+    var upload = await uploadToStorage(arrayBuffer, file.name, file.type);
+    if (upload.error) return json({ error: upload.error }, 400);
+
+    return json({ url: upload.url });
   }
 
   // For /assets/* — let platform serve static files

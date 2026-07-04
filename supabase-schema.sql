@@ -87,3 +87,26 @@ GRANT USAGE ON SEQUENCE users_id_seq TO anon, authenticated;
 GRANT USAGE ON SEQUENCE fde_profiles_id_seq TO anon, authenticated;
 GRANT USAGE ON SEQUENCE pending_profiles_id_seq TO anon, authenticated;
 GRANT USAGE ON SEQUENCE articles_id_seq TO anon, authenticated;
+
+-- ============================================================
+-- Supabase Storage — 文件上传 bucket（手动创建或由边缘函数自动创建）
+-- 在 Supabase 控制台 → Storage → New Bucket 创建：
+--   Name: fde-uploads
+--   Public bucket: ✓ (勾选)
+--   File size limit: 5MB
+--   Allowed MIME types: image/png, image/jpeg, image/gif, image/webp
+-- ============================================================
+
+-- Storage 权限策略（在 Supabase 控制台 → Storage → Policies 中创建）：
+-- 1. fde-uploads bucket → Policy: "Allow all"
+--    Allowed operations: SELECT, INSERT, UPDATE, DELETE
+--    Policy definition: true (允许所有操作，因为 edge function 在后端运行)
+--
+-- 或执行以下 SQL（如果 Storage SQL 可用）：
+-- INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+-- VALUES ('fde-uploads', 'fde-uploads', true, 5242880,
+--         ARRAY['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+-- ON CONFLICT (id) DO NOTHING;
+--
+-- CREATE POLICY "Allow all access via backend" ON storage.objects
+--   FOR ALL USING (true) WITH CHECK (true);
