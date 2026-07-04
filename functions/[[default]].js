@@ -1,18 +1,13 @@
 /**
- * EdgeOne Pages Edge Function - Main API Handler
+ * EdgeOne Pages Edge Function - Catch-all Handler
  * 
- * Catches all /api/* requests and routes them internally.
- * Implements the same functionality as the original Express backend
- * but uses Web standard Request/Response APIs for EdgeOne compatibility.
- * 
- * Key differences from original:
- * - In-memory database (no filesystem)
- * - File uploads via base64 data URLs (no disk storage)
- * - Web standard Request/Response (no Express)
+ * Handles ALL routes:
+ * - /api/*  → API logic (JSON responses)
+ * - /*     → SPA fallback (serves index.html)
  */
 
-const db = require('../../lib/db');
-const { generateToken, authRequired, authOptional, adminRequired } = require('../../lib/auth');
+const db = require('../lib/db');
+const { generateToken, authRequired, authOptional, adminRequired } = require('../lib/auth');
 
 // ===================== Helpers =====================
 
@@ -33,7 +28,6 @@ function error(msg, status = 400) {
 }
 
 function getQueryParams(url) {
-  // Handle both absolute and relative URLs
   const fullUrl = url.startsWith('http') ? url : `http://localhost${url}`;
   const parsed = new URL(fullUrl);
   const params = {};
@@ -44,11 +38,7 @@ function getQueryParams(url) {
 async function parseBody(request) {
   const contentType = request.headers.get('content-type') || '';
   if (contentType.includes('application/json')) {
-    try {
-      return await request.json();
-    } catch (e) {
-      return {};
-    }
+    try { return await request.json(); } catch (e) { return {}; }
   }
   if (contentType.includes('multipart/form-data')) {
     try {
@@ -56,7 +46,6 @@ async function parseBody(request) {
       const body = {};
       for (const [key, value] of formData.entries()) {
         if (value instanceof File) {
-          // Convert File to base64 data URL
           const buffer = await value.arrayBuffer();
           const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
           body[key] = `data:${value.type};base64,${base64}`;
@@ -65,11 +54,18 @@ async function parseBody(request) {
         }
       }
       return body;
-    } catch (e) {
-      return {};
-    }
+    } catch (e) { return {}; }
   }
   return {};
+}
+
+// ===================== SPA Fallback =====================
+
+function serveSPA() {
+  return new Response(SPA_HTML, {
+    status: 200,
+    headers: { 'Content-Type': 'text/html; charset=utf-8' }
+  });
 }
 
 // ===================== Route Handlers =====================
@@ -81,7 +77,6 @@ async function handleAuthRegister(request) {
   const { username, password, email } = body;
   if (!username || !password) return error('用户名和密码不能为空');
   if (password.length < 6) return error('密码长度至少6位');
-
   const uniqueName = db.users.ensureUniqueUsername(username);
   const user = db.users.create({ username: uniqueName, password, email: email || '' });
   const token = generateToken({ id: user.id, username: user.username, role: user.role });
@@ -92,36 +87,26 @@ async function handleAuthLogin(request) {
   const body = await parseBody(request);
   const { username, password } = body;
   if (!username || !password) return error('用户名和密码不能为空');
-
   const user = db.users.findByUsernameOrSuffix(username, password);
   if (!user) return error('用户名或密码错误', 401);
-
   const token = generateToken({ id: user.id, username: user.username, role: user.role });
-  return json({
-    token,
-    user: { id: user.id, username: user.username, role: user.role, email: user.email }
-  });
+  return json({ token, user: { id: user.id, username: user.username, role: user.role, email: user.email } });
 }
 
 async function handleAuthMe(request) {
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
-
   const user = db.users.findById(auth.user.id);
   if (!user) return error('用户不存在', 404);
   const { password_hash, ...safe } = user;
   const profile = db.fde_profiles.findByUserId(auth.user.id);
-  if (profile) {
-    safe.avatar_url = profile.avatar_url || '';
-    safe.name = profile.name || '';
-  }
+  if (profile) { safe.avatar_url = profile.avatar_url || ''; safe.name = profile.name || ''; }
   return json(safe);
 }
 
 async function handleAuthPassword(request) {
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
-
   const body = await parseBody(request);
   const { oldPassword, newPassword } = body;
   const user = db.users.findById(auth.user.id);
@@ -152,7 +137,6 @@ async function handleAuthUserRole(request, userId) {
   if (auth.error) return error(auth.error, auth.status);
   const adminCheck = adminRequired(auth.user);
   if (adminCheck.error) return error(adminCheck.error, adminCheck.status);
-
   const body = await parseBody(request);
   const { role } = body;
   if (!['user', 'admin'].includes(role)) return error('无效的角色');
@@ -212,10 +196,8 @@ async function handleFdeReviewUpdate(request, reviewId) {
   if (auth.error) return error(auth.error, auth.status);
   const adminCheck = adminRequired(auth.user);
   if (adminCheck.error) return error(adminCheck.error, adminCheck.status);
-
   const review = db.pending_profiles.findById(reviewId);
   if (!review) return error('审核记录不存在', 404);
-
   const body = await parseBody(request);
   const { name, title, city, description, work_details, resources_needed, skills, email, phone, avatar_url, wechat_qr_url } = body;
   const updated = db.pending_profiles.update(reviewId, { name, title, city, description, work_details, resources_needed, skills, email, phone, avatar_url, wechat_qr_url });
@@ -233,14 +215,10 @@ async function handleFdeUpdateProfile(request, userId) {
   if (isNaN(userId)) return error('无效的用户ID');
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
-  if (auth.user.role !== 'admin' && auth.user.id !== userId) {
-    return error('只能修改自己的信息', 403);
-  }
-
+  if (auth.user.role !== 'admin' && auth.user.id !== userId) return error('只能修改自己的信息', 403);
   const body = await parseBody(request);
   const { name, title, city, description, work_details, resources_needed, skills, email, phone, wechat_qr_url } = body;
   const fields = { name, title, city, description, work_details, resources_needed, skills, email, phone };
-
   if (auth.user.role === 'admin') {
     const updated = db.fde_profiles.update(userId, fields);
     if (!updated) return error('FDE 信息不存在', 404);
@@ -249,8 +227,7 @@ async function handleFdeUpdateProfile(request, userId) {
     }
     return json({ ...db.fde_profiles.findByUserId(userId), reviewed: true });
   }
-
-  // Non-admin: save to pending for review
+  // Non-admin: save to pending
   const current = db.fde_profiles.findByUserId(userId);
   const existingReview = db.pending_profiles.findByUserId(userId);
   const merged = {
@@ -263,9 +240,7 @@ async function handleFdeUpdateProfile(request, userId) {
     skills: skills !== undefined ? skills : (existingReview?.profile_data?.skills ?? current?.skills ?? ''),
     email: email !== undefined ? email : (existingReview?.profile_data?.email ?? current?.email ?? ''),
     phone: phone !== undefined ? phone : (existingReview?.profile_data?.phone ?? current?.phone ?? ''),
-    wechat_qr_url: wechat_qr_url !== undefined
-      ? (wechat_qr_url || '')
-      : (existingReview?.profile_data?.wechat_qr_url ?? current?.wechat_qr_url ?? '')
+    wechat_qr_url: wechat_qr_url !== undefined ? (wechat_qr_url || '') : (existingReview?.profile_data?.wechat_qr_url ?? current?.wechat_qr_url ?? '')
   };
   db.pending_profiles.create({ user_id: userId, profile_data: merged });
   const profile = db.fde_profiles.findByUserId(userId);
@@ -277,7 +252,6 @@ async function handleFdeDeleteProfile(request, userId) {
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
   if (auth.user.role !== 'admin') return error('仅管理员可删除 FDE 信息', 403);
-
   const deleted = db.fde_profiles.delete(userId);
   if (!deleted) return error('FDE 信息不存在', 404);
   return json({ success: true, message: '已删除' });
@@ -287,19 +261,14 @@ async function handleFdeUploadAvatar(request, userId) {
   if (isNaN(userId)) return error('无效的用户ID');
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
-  if (auth.user.role !== 'admin' && auth.user.id !== userId) {
-    return error('只能修改自己的头像', 403);
-  }
-
+  if (auth.user.role !== 'admin' && auth.user.id !== userId) return error('只能修改自己的头像', 403);
   const body = await parseBody(request);
   const avatarData = body.avatar;
   if (!avatarData) return error('请上传图片');
-
   if (auth.user.role === 'admin') {
     db.fde_profiles.updateAvatar(userId, avatarData);
     return json({ url: avatarData, reviewed: true });
   }
-
   const current = db.fde_profiles.findByUserId(userId);
   const existingReview = db.pending_profiles.findByUserId(userId);
   const profile_data = existingReview?.profile_data || {
@@ -318,19 +287,14 @@ async function handleFdeUploadQrCode(request, userId) {
   if (isNaN(userId)) return error('无效的用户ID');
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
-  if (auth.user.role !== 'admin' && auth.user.id !== userId) {
-    return error('只能修改自己的二维码', 403);
-  }
-
+  if (auth.user.role !== 'admin' && auth.user.id !== userId) return error('只能修改自己的二维码', 403);
   const body = await parseBody(request);
   const qrData = body.qrcode;
   if (!qrData) return error('请上传图片');
-
   if (auth.user.role === 'admin') {
     db.fde_profiles.updateQrCode(userId, qrData);
     return json({ url: qrData, reviewed: true });
   }
-
   const current = db.fde_profiles.findByUserId(userId);
   const existingReview = db.pending_profiles.findByUserId(userId);
   const profile_data = existingReview?.profile_data || {
@@ -349,11 +313,7 @@ async function handleFdeUploadQrCode(request, userId) {
 
 async function handleArticlesList(request) {
   const { category, page, limit } = getQueryParams(request.url);
-  return json(db.articles.findAll({
-    category,
-    page: parseInt(page) || 1,
-    limit: parseInt(limit) || 12
-  }));
+  return json(db.articles.findAll({ category, page: parseInt(page) || 1, limit: parseInt(limit) || 12 }));
 }
 
 async function handleArticlesCategories() {
@@ -369,27 +329,19 @@ async function handleArticleGet(id) {
 async function handleArticleCreate(request) {
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
-
   const body = await parseBody(request);
   const { title, summary, content, category } = body;
   if (!title || !content) return error('标题和内容不能为空');
-
-  const article = db.articles.create({
-    author_id: auth.user.id, title, summary, content, category
-  });
+  const article = db.articles.create({ author_id: auth.user.id, title, summary, content, category });
   return json(article, 201);
 }
 
 async function handleArticleUpdate(request, id) {
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
-
   const article = db.articles.findById(id);
   if (!article) return error('文章不存在', 404);
-  if (auth.user.role !== 'admin' && auth.user.id !== article.author_id) {
-    return error('只能修改自己的文章', 403);
-  }
-
+  if (auth.user.role !== 'admin' && auth.user.id !== article.author_id) return error('只能修改自己的文章', 403);
   const body = await parseBody(request);
   const { title, summary, content, category } = body;
   const updated = db.articles.update(id, { title, summary, content, category });
@@ -399,13 +351,9 @@ async function handleArticleUpdate(request, id) {
 async function handleArticleDelete(request, id) {
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
-
   const article = db.articles.findById(id);
   if (!article) return error('文章不存在', 404);
-  if (auth.user.role !== 'admin' && auth.user.id !== article.author_id) {
-    return error('只能删除自己的文章', 403);
-  }
-
+  if (auth.user.role !== 'admin' && auth.user.id !== article.author_id) return error('只能删除自己的文章', 403);
   db.articles.delete(id);
   return json({ message: '文章已删除' });
 }
@@ -413,26 +361,99 @@ async function handleArticleDelete(request, id) {
 async function handleArticleUploadCover(request) {
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
-
   const body = await parseBody(request);
   const coverData = body.cover;
   if (!coverData) return error('请上传图片');
   return json({ url: coverData });
 }
 
-// ===================== Main Router =====================
+// ===================== API Router =====================
 
-/**
- * EdgeOne Pages Edge Function entry point.
- * File-based routing: /functions/api/[[route]].js -> /api/*
- */
+async function handleAPI(path, method, request) {
+  // Health
+  if (path === '/api/health' && method === 'GET') {
+    return json({ status: 'ok', timestamp: new Date().toISOString() });
+  }
+
+  // Auth
+  if (path === '/api/auth/register' && method === 'POST') return await handleAuthRegister(request);
+  if (path === '/api/auth/login' && method === 'POST') return await handleAuthLogin(request);
+  if (path === '/api/auth/me' && method === 'GET') return await handleAuthMe(request);
+  if (path === '/api/auth/password' && method === 'PUT') return await handleAuthPassword(request);
+  if (path === '/api/auth/users' && method === 'GET') return await handleAuthUsers(request);
+  if (path === '/api/auth/reset' && method === 'POST') return await handleAuthReset(request);
+
+  const authUserRoleMatch = path.match(/^\/api\/auth\/users\/(\d+)\/role$/);
+  if (authUserRoleMatch && method === 'PUT') return await handleAuthUserRole(request, parseInt(authUserRoleMatch[1]));
+
+  // FDE
+  if (path === '/api/fde' && method === 'GET') return await handleFdeList(request);
+  if (path === '/api/fde/cities' && method === 'GET') return await handleFdeCities();
+  if (path === '/api/fde/my-pending' && method === 'GET') return await handleFdeMyPending(request);
+  if (path === '/api/fde/reviews' && method === 'GET') return await handleFdeReviews(request);
+
+  const reviewApproveMatch = path.match(/^\/api\/fde\/reviews\/(\d+)\/approve$/);
+  if (reviewApproveMatch && method === 'POST') return await handleFdeReviewApprove(request, parseInt(reviewApproveMatch[1]));
+  const reviewRejectMatch = path.match(/^\/api\/fde\/reviews\/(\d+)\/reject$/);
+  if (reviewRejectMatch && method === 'POST') return await handleFdeReviewReject(request, parseInt(reviewRejectMatch[1]));
+  const reviewUpdateMatch = path.match(/^\/api\/fde\/reviews\/(\d+)$/);
+  if (reviewUpdateMatch && method === 'PUT') return await handleFdeReviewUpdate(request, parseInt(reviewUpdateMatch[1]));
+
+  const fdeGetMatch = path.match(/^\/api\/fde\/(\d+)$/);
+  if (fdeGetMatch && method === 'GET') return await handleFdeGetProfile(parseInt(fdeGetMatch[1]));
+  if (fdeGetMatch && method === 'PUT') return await handleFdeUpdateProfile(request, parseInt(fdeGetMatch[1]));
+  if (fdeGetMatch && method === 'DELETE') return await handleFdeDeleteProfile(request, parseInt(fdeGetMatch[1]));
+
+  const fdeAvatarMatch = path.match(/^\/api\/fde\/(\d+)\/avatar$/);
+  if (fdeAvatarMatch && method === 'POST') return await handleFdeUploadAvatar(request, parseInt(fdeAvatarMatch[1]));
+  const fdeQrMatch = path.match(/^\/api\/fde\/(\d+)\/qrcode$/);
+  if (fdeQrMatch && method === 'POST') return await handleFdeUploadQrCode(request, parseInt(fdeQrMatch[1]));
+
+  // Articles
+  if (path === '/api/articles' && method === 'GET') return await handleArticlesList(request);
+  if (path === '/api/articles/categories' && method === 'GET') return await handleArticlesCategories();
+  if (path === '/api/articles/upload-cover' && method === 'POST') return await handleArticleUploadCover(request);
+  if (path === '/api/articles' && method === 'POST') return await handleArticleCreate(request);
+
+  const articleGetMatch = path.match(/^\/api\/articles\/(\d+)$/);
+  if (articleGetMatch && method === 'GET') return await handleArticleGet(parseInt(articleGetMatch[1]));
+  if (articleGetMatch && method === 'PUT') return await handleArticleUpdate(request, parseInt(articleGetMatch[1]));
+  if (articleGetMatch && method === 'DELETE') return await handleArticleDelete(request, parseInt(articleGetMatch[1]));
+
+  return error('Not Found', 404);
+}
+
+// ===================== SPA HTML (inline) =====================
+// NOTE: When the frontend is rebuilt, update this HTML by copying
+// the content of the built index.html from the frontend's dist/ directory.
+
+const SPA_HTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚀</text></svg>" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Urbanist:wght@500;600;700&display=swap" rel="stylesheet" />
+    <title>FDE - 前沿部署工程师</title>
+    <script type="module" crossorigin src="/assets/index-B-KrccSR.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-mLBsqG2v.css">
+  </head>
+  <body class="bg-gray-50 min-h-screen">
+    <div id="root"></div>
+  </body>
+</html>`;
+
+// ===================== Main Entry Point =====================
+
 async function onRequest(context) {
   const { request } = context;
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method.toUpperCase();
 
-  // Handle CORS preflight
+  // CORS preflight
   if (method === 'OPTIONS') {
     return new Response(null, {
       status: 204,
@@ -445,132 +466,19 @@ async function onRequest(context) {
     });
   }
 
-  try {
-    // ===================== Health Check =====================
-    if (path === '/api/health' && method === 'GET') {
-      return json({ status: 'ok', timestamp: new Date().toISOString() });
+  // API routes
+  if (path.startsWith('/api/')) {
+    try {
+      return await handleAPI(path, method, request);
+    } catch (err) {
+      console.error('[API Error]', err.message, err.stack);
+      return error('服务器内部错误: ' + err.message, 500);
     }
-
-    // ===================== Auth Routes =====================
-    if (path === '/api/auth/register' && method === 'POST') {
-      return await handleAuthRegister(request);
-    }
-    if (path === '/api/auth/login' && method === 'POST') {
-      return await handleAuthLogin(request);
-    }
-    if (path === '/api/auth/me' && method === 'GET') {
-      return await handleAuthMe(request);
-    }
-    if (path === '/api/auth/password' && method === 'PUT') {
-      return await handleAuthPassword(request);
-    }
-    if (path === '/api/auth/users' && method === 'GET') {
-      return await handleAuthUsers(request);
-    }
-    if (path === '/api/auth/reset' && method === 'POST') {
-      return await handleAuthReset(request);
-    }
-    // PUT /api/auth/users/:id/role
-    const authUserRoleMatch = path.match(/^\/api\/auth\/users\/(\d+)\/role$/);
-    if (authUserRoleMatch && method === 'PUT') {
-      return await handleAuthUserRole(request, parseInt(authUserRoleMatch[1]));
-    }
-
-    // ===================== FDE Routes =====================
-    // GET /api/fde
-    if (path === '/api/fde' && method === 'GET') {
-      return await handleFdeList(request);
-    }
-    // GET /api/fde/cities
-    if (path === '/api/fde/cities' && method === 'GET') {
-      return await handleFdeCities();
-    }
-    // GET /api/fde/my-pending
-    if (path === '/api/fde/my-pending' && method === 'GET') {
-      return await handleFdeMyPending(request);
-    }
-    // GET /api/fde/reviews
-    if (path === '/api/fde/reviews' && method === 'GET') {
-      return await handleFdeReviews(request);
-    }
-    // POST /api/fde/reviews/:id/approve
-    const reviewApproveMatch = path.match(/^\/api\/fde\/reviews\/(\d+)\/approve$/);
-    if (reviewApproveMatch && method === 'POST') {
-      return await handleFdeReviewApprove(request, parseInt(reviewApproveMatch[1]));
-    }
-    // POST /api/fde/reviews/:id/reject
-    const reviewRejectMatch = path.match(/^\/api\/fde\/reviews\/(\d+)\/reject$/);
-    if (reviewRejectMatch && method === 'POST') {
-      return await handleFdeReviewReject(request, parseInt(reviewRejectMatch[1]));
-    }
-    // PUT /api/fde/reviews/:id
-    const reviewUpdateMatch = path.match(/^\/api\/fde\/reviews\/(\d+)$/);
-    if (reviewUpdateMatch && method === 'PUT') {
-      return await handleFdeReviewUpdate(request, parseInt(reviewUpdateMatch[1]));
-    }
-    // GET /api/fde/:userId
-    const fdeGetMatch = path.match(/^\/api\/fde\/(\d+)$/);
-    if (fdeGetMatch && method === 'GET') {
-      return await handleFdeGetProfile(parseInt(fdeGetMatch[1]));
-    }
-    // PUT /api/fde/:userId
-    if (fdeGetMatch && method === 'PUT') {
-      return await handleFdeUpdateProfile(request, parseInt(fdeGetMatch[1]));
-    }
-    // DELETE /api/fde/:userId
-    if (fdeGetMatch && method === 'DELETE') {
-      return await handleFdeDeleteProfile(request, parseInt(fdeGetMatch[1]));
-    }
-    // POST /api/fde/:userId/avatar
-    const fdeAvatarMatch = path.match(/^\/api\/fde\/(\d+)\/avatar$/);
-    if (fdeAvatarMatch && method === 'POST') {
-      return await handleFdeUploadAvatar(request, parseInt(fdeAvatarMatch[1]));
-    }
-    // POST /api/fde/:userId/qrcode
-    const fdeQrMatch = path.match(/^\/api\/fde\/(\d+)\/qrcode$/);
-    if (fdeQrMatch && method === 'POST') {
-      return await handleFdeUploadQrCode(request, parseInt(fdeQrMatch[1]));
-    }
-
-    // ===================== Articles Routes =====================
-    // GET /api/articles
-    if (path === '/api/articles' && method === 'GET') {
-      return await handleArticlesList(request);
-    }
-    // GET /api/articles/categories
-    if (path === '/api/articles/categories' && method === 'GET') {
-      return await handleArticlesCategories();
-    }
-    // POST /api/articles/upload-cover
-    if (path === '/api/articles/upload-cover' && method === 'POST') {
-      return await handleArticleUploadCover(request);
-    }
-    // POST /api/articles
-    if (path === '/api/articles' && method === 'POST') {
-      return await handleArticleCreate(request);
-    }
-    // GET /api/articles/:id
-    const articleGetMatch = path.match(/^\/api\/articles\/(\d+)$/);
-    if (articleGetMatch && method === 'GET') {
-      return await handleArticleGet(parseInt(articleGetMatch[1]));
-    }
-    // PUT /api/articles/:id
-    if (articleGetMatch && method === 'PUT') {
-      return await handleArticleUpdate(request, parseInt(articleGetMatch[1]));
-    }
-    // DELETE /api/articles/:id
-    if (articleGetMatch && method === 'DELETE') {
-      return await handleArticleDelete(request, parseInt(articleGetMatch[1]));
-    }
-
-    // 404
-    return error('Not Found', 404);
-
-  } catch (err) {
-    console.error('[API Error]', err.message, err.stack);
-    return error('服务器内部错误: ' + err.message, 500);
   }
+
+  // SPA fallback: serve index.html for all non-API, non-asset routes
+  // EdgeOne serves exact static file matches (/assets/*) automatically before edge functions
+  return serveSPA();
 }
 
-// EdgeOne Pages exports onRequest function
 module.exports = { onRequest };
