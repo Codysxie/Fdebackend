@@ -290,8 +290,44 @@ export default async function onRequest(context) {
     return json({
       status: 'ok', timestamp: now(),
       supabase_url: SB_URL ? 'configured' : 'missing',
-      supabase_key: SB_KEY ? 'configured' : 'missing'
+      supabase_key: SB_KEY ? 'configured' : 'missing',
+      version: 'edge-v2.1-review-fix'
     });
+  }
+
+  // /api/diag/review-test — test pending_profiles table
+  if (path === '/api/diag/review-test' && method === 'GET') {
+    var diag = {};
+    // 1. Check table exists
+    var t1 = await supabaseREST('pending_profiles', 'GET', null, ['select=id', 'limit=1']);
+    diag.pending_profiles_read = { ok: !t1.error, error: t1.error || null };
+
+    // 2. Test write
+    var testUserId = -99999;
+    var testBody = { user_id: testUserId, profile_data: { name: '__diag_test__' }, created_at: now() };
+    var t2 = await supabaseREST('pending_profiles', 'POST', testBody, ['select=id']);
+    diag.pending_profiles_write = { ok: !t2.error, error: t2.error || null, data: t2.data || null };
+
+    // 3. Cleanup test record
+    if (!t2.error) {
+      var testId = null;
+      if (Array.isArray(t2.data)) testId = t2.data[0]?.id;
+      else if (t2.data) testId = t2.data.id;
+      if (testId) {
+        await supabaseREST('pending_profiles', 'DELETE', null, ['id=eq.' + testId]);
+        diag.cleanup = 'deleted test record id=' + testId;
+      }
+    }
+
+    // 4. Check current pending count
+    var t3 = await supabaseREST('pending_profiles', 'GET', null, ['select=id']);
+    diag.total_pending = (!t3.error && Array.isArray(t3.data)) ? t3.data.length : -1;
+
+    // 5. Check fde_profiles count
+    var t4 = await supabaseREST('fde_profiles', 'GET', null, ['select=id']);
+    diag.total_profiles = (!t4.error && Array.isArray(t4.data)) ? t4.data.length : -1;
+
+    return json(diag);
   }
 
   // /api/test-env
