@@ -483,12 +483,15 @@ export default async function onRequest(context) {
     if (rev.error) return json({ error: '查询审批记录失败' }, 500);
     var revData = Array.isArray(rev.data) ? rev.data[0] : rev.data;
     if (!revData) return json({ error: '审批记录不存在' }, 404);
-    // Apply profile changes
+    // Apply profile changes — copy pending profile_data into live fde_profiles
     var pd = revData.profile_data || {};
-    await supabaseREST('fde_profiles', 'PATCH', Object.assign({}, pd, { updated_at: now() }), ['user_id=eq.' + revData.user_id]);
+    var upPr = await supabaseREST('fde_profiles', 'PATCH', Object.assign({}, pd, { updated_at: now() }), ['user_id=eq.' + revData.user_id, 'select=*']);
     // Delete pending record
     await supabaseREST('pending_profiles', 'DELETE', null, ['id=eq.' + reviewId]);
-    return json({ ok: true });
+    var profile = (!upPr.error && upPr.data && upPr.data.length > 0)
+      ? (Array.isArray(upPr.data) ? upPr.data[0] : upPr.data)
+      : {};
+    return json({ message: '已通过审核', profile: profile });
   }
 
   // POST|PUT /api/fde/reviews/:id/reject
@@ -499,7 +502,7 @@ export default async function onRequest(context) {
     if (auth.role !== 'admin') return json({ error: '权限不足' }, 403);
     var reviewId = parseInt(rejectMatch[1]);
     await supabaseREST('pending_profiles', 'DELETE', null, ['id=eq.' + reviewId]);
-    return json({ ok: true });
+    return json({ message: '已驳回审核' });
   }
 
   // GET/PUT /api/fde/reviews/:id
@@ -559,45 +562,86 @@ export default async function onRequest(context) {
     if (method === 'PUT') {
       var auth = getAuth();
       if (!auth) return json({ error: '请先登录' }, 401);
-      // User can only update their own profile, admin can update any
       if (auth.role !== 'admin' && auth.id !== fdeUserId) {
         return json({ error: '权限不足' }, 403);
       }
       var body = await parseBody();
-      // Upsert: ensure profile exists
-      var exists = await supabaseREST('fde_profiles', 'GET', null, ['select=id', 'user_id=eq.' + fdeUserId]);
-      var existsData = Array.isArray(exists.data) ? exists.data : (exists.data ? [exists.data] : []);
-      if (existsData.length === 0) {
-        // Create profile
-        var createBody = Object.assign({
-          user_id: fdeUserId, name: '', email: '', created_at: now(), updated_at: now()
-        }, body);
-        var cr = await supabaseREST('fde_profiles', 'POST', createBody, ['select=*']);
-        if (cr.error) return json({ error: '创建资料失败' }, 500);
-        var cd = Array.isArray(cr.data) ? cr.data[0] : cr.data;
-        return json(cd);
-      } else {
-        // Check if there's a pending review for this user
-        var pendingCheck = await supabaseREST('pending_profiles', 'GET', null, ['select=id,user_id', 'user_id=eq.' + fdeUserId]);
-        var hasPending = !pendingCheck.error && pendingCheck.data && pendingCheck.data.length > 0;
 
-        if (auth.role !== 'admin' && hasPending) {
-          // Non-admin with pending: update pending record instead
-          var uRe = await supabaseREST('pending_profiles', 'PATCH', {
-            profile_data: body, created_at: now()
-          }, ['user_id=eq.' + fdeUserId, 'select=*']);
-          if (uRe.error) return json({ error: '更新待审核资料失败' }, 500);
-          var uReData = Array.isArray(uRe.data) ? uRe.data[0] : uRe.data;
-          return json(uReData);
+      // === Admin: directly update fde_profiles (no review needed) ===
+      if (auth.role === 'admin') {
+        var exists = await supabaseREST('fde_profiles', 'GET', null, ['select=id', 'user_id=eq.' + fdeUserId]);
+        var existsData = Array.isArray(exists.data) ? exists.data : (exists.data ? [exists.data] : []);
+        if (existsData.length === 0) {
+          var createBody = Object.assign({
+            user_id: fdeUserId, name: '', email: '', created_at: now(), updated_at: now()
+          }, body);
+          var cr = await supabaseREST('fde_profiles', 'POST', createBody, ['select=*']);
+          if (cr.error) return json({ error: '创建资料失败' }, 500);
+          var cd = Array.isArray(cr.data) ? cr.data[0] : cr.data;
+          cd.reviewed = true;
+          return json(cd);
         }
-
-        // Update profile directly
-        var updateBody = Object.assign({}, body, { updated_at: now() });
+        var updateBody = Object.assign({ updated_at: now() }, body);
         var up = await supabaseREST('fde_profiles', 'PATCH', updateBody, ['user_id=eq.' + fdeUserId, 'select=*']);
         if (up.error) return json({ error: '更新资料失败' }, 500);
         var ud = Array.isArray(up.data) ? up.data[0] : up.data;
+        ud.reviewed = true;
         return json(ud);
       }
+
+      // === Non-admin: always create/update a pending_profiles record ===
+      // Step 1: get current profile (used as merge fallback)
+      var cur = await supabaseREST('fde_profiles', 'GET', null, ['select=*', 'user_id=eq.' + fdeUserId]);
+      var currentProfile = (!cur.error && cur.data && cur.data.length > 0)
+        ? (Array.isArray(cur.data) ? cur.data[0] : cur.data)
+        : {};
+
+      // Step 2: get existing pending review (for merge fallback)
+      var existPend = await supabaseREST('pending_profiles', 'GET', null, ['select=*', 'user_id=eq.' + fdeUserId]);
+      var existingReview = (!existPend.error && existPend.data && existPend.data.length > 0)
+        ? (Array.isArray(existPend.data) ? existPend.data[0] : existPend.data)
+        : null;
+
+      // Step 3: merge — body value > existing review > current profile > ''
+      function mval(key) {
+        if (body[key] !== undefined) return body[key];
+        if (existingReview && existingReview.profile_data && existingReview.profile_data[key] !== undefined)
+          return existingReview.profile_data[key];
+        if (currentProfile[key] !== undefined) return currentProfile[key];
+        return '';
+      }
+      var merged = {
+        name: mval('name'), title: mval('title'), city: mval('city'),
+        description: mval('description'), work_details: mval('work_details'),
+        resources_needed: mval('resources_needed'), skills: mval('skills'),
+        email: mval('email'), phone: mval('phone'),
+        avatar_url: mval('avatar_url'), wechat_qr_url: mval('wechat_qr_url')
+      };
+
+      // Step 4: upsert pending_profiles (single record per user)
+      if (existingReview) {
+        var upRe = await supabaseREST('pending_profiles', 'PATCH', {
+          profile_data: merged, created_at: now()
+        }, ['user_id=eq.' + fdeUserId, 'select=*']);
+        if (upRe.error) return json({ error: '提交审核失败' }, 500);
+      } else {
+        var crRe = await supabaseREST('pending_profiles', 'POST', {
+          user_id: fdeUserId, profile_data: merged, created_at: now()
+        }, ['select=*']);
+        if (crRe.error) return json({ error: '提交审核失败' }, 500);
+      }
+
+      // Step 5: return merged profile with reviewed: false
+      var result = Object.assign({}, currentProfile, merged);
+      result.reviewed = false;
+      result.hasPending = true;
+      result.message = '已提交审核，请等待管理员审核';
+      var uRes = await supabaseREST('users', 'GET', null, ['select=id,username,role', 'id=eq.' + fdeUserId]);
+      if (!uRes.error && uRes.data) {
+        var uData = Array.isArray(uRes.data) ? uRes.data[0] : uRes.data;
+        if (uData) { result.username = uData.username || ''; result.role = uData.role || 'user'; }
+      }
+      return json(result);
     }
   }
 
