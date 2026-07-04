@@ -1,0 +1,11 @@
+{
+  "name": "fde-server",
+  "version": "1.0.0",
+  "description": "FDE Technical Service Website - EdgeOne Backend",
+  "private": true,
+  "scripts": {},
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.3"
+  }
+}
