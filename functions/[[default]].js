@@ -77,8 +77,8 @@ async function handleAuthRegister(request) {
   const { username, password, email } = body;
   if (!username || !password) return error('用户名和密码不能为空');
   if (password.length < 6) return error('密码长度至少6位');
-  const uniqueName = db.users.ensureUniqueUsername(username);
-  const user = db.users.create({ username: uniqueName, password, email: email || '' });
+  const uniqueName = await db.users.ensureUniqueUsername(username);
+  const user = await db.users.create({ username: uniqueName, password, email: email || '' });
   const token = generateToken({ id: user.id, username: user.username, role: user.role });
   return json({ token, user }, 201);
 }
@@ -87,7 +87,7 @@ async function handleAuthLogin(request) {
   const body = await parseBody(request);
   const { username, password } = body;
   if (!username || !password) return error('用户名和密码不能为空');
-  const user = db.users.findByUsernameOrSuffix(username, password);
+  const user = await db.users.findByUsernameOrSuffix(username, password);
   if (!user) return error('用户名或密码错误', 401);
   const token = generateToken({ id: user.id, username: user.username, role: user.role });
   return json({ token, user: { id: user.id, username: user.username, role: user.role, email: user.email } });
@@ -96,10 +96,10 @@ async function handleAuthLogin(request) {
 async function handleAuthMe(request) {
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
-  const user = db.users.findById(auth.user.id);
+  const user = await db.users.findById(auth.user.id);
   if (!user) return error('用户不存在', 404);
   const { password_hash, ...safe } = user;
-  const profile = db.fde_profiles.findByUserId(auth.user.id);
+  const profile = await db.fde_profiles.findByUserId(auth.user.id);
   if (profile) { safe.avatar_url = profile.avatar_url || ''; safe.name = profile.name || ''; }
   return json(safe);
 }
@@ -109,9 +109,9 @@ async function handleAuthPassword(request) {
   if (auth.error) return error(auth.error, auth.status);
   const body = await parseBody(request);
   const { oldPassword, newPassword } = body;
-  const user = db.users.findById(auth.user.id);
+  const user = await db.users.findById(auth.user.id);
   if (!db.users.verifyPassword(user, oldPassword)) return error('原密码错误');
-  db.users.changePassword(auth.user.id, newPassword);
+  await db.users.changePassword(auth.user.id, newPassword);
   return json({ message: '密码修改成功' });
 }
 
@@ -120,7 +120,7 @@ async function handleAuthUsers(request) {
   if (auth.error) return error(auth.error, auth.status);
   const adminCheck = adminRequired(auth.user);
   if (adminCheck.error) return error(adminCheck.error, adminCheck.status);
-  return json(db.users.findAll());
+  return json(await db.users.findAll());
 }
 
 async function handleAuthReset(request) {
@@ -128,7 +128,7 @@ async function handleAuthReset(request) {
   if (auth.error) return error(auth.error, auth.status);
   const adminCheck = adminRequired(auth.user);
   if (adminCheck.error) return error(adminCheck.error, adminCheck.status);
-  db.resetToAdmin();
+  await db.resetToAdmin();
   return json({ message: '数据已重置，仅保留管理员账户' });
 }
 
@@ -140,7 +140,7 @@ async function handleAuthUserRole(request, userId) {
   const body = await parseBody(request);
   const { role } = body;
   if (!['user', 'admin'].includes(role)) return error('无效的角色');
-  db.users.updateRole(userId, role);
+  await db.users.updateRole(userId, role);
   return json({ message: '角色更新成功' });
 }
 
@@ -148,17 +148,17 @@ async function handleAuthUserRole(request, userId) {
 
 async function handleFdeList(request) {
   const { city } = getQueryParams(request.url);
-  return json(db.fde_profiles.findAll({ city }));
+  return json(await db.fde_profiles.findAll({ city }));
 }
 
 async function handleFdeCities() {
-  return json(db.fde_profiles.getCities());
+  return json(await db.fde_profiles.getCities());
 }
 
 async function handleFdeMyPending(request) {
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
-  const review = db.pending_profiles.findByUserId(auth.user.id);
+  const review = await db.pending_profiles.findByUserId(auth.user.id);
   return json({ hasPending: !!review, review: review || null });
 }
 
@@ -167,7 +167,7 @@ async function handleFdeReviews(request) {
   if (auth.error) return error(auth.error, auth.status);
   const adminCheck = adminRequired(auth.user);
   if (adminCheck.error) return error(adminCheck.error, adminCheck.status);
-  const reviews = db.pending_profiles.findAll();
+  const reviews = await db.pending_profiles.findAll();
   return json({ reviews, count: reviews.length });
 }
 
@@ -176,7 +176,7 @@ async function handleFdeReviewApprove(request, reviewId) {
   if (auth.error) return error(auth.error, auth.status);
   const adminCheck = adminRequired(auth.user);
   if (adminCheck.error) return error(adminCheck.error, adminCheck.status);
-  const approved = db.pending_profiles.approve(reviewId);
+  const approved = await db.pending_profiles.approve(reviewId);
   if (!approved) return error('审核记录不存在', 404);
   return json({ message: '已通过审核', profile: approved });
 }
@@ -186,7 +186,7 @@ async function handleFdeReviewReject(request, reviewId) {
   if (auth.error) return error(auth.error, auth.status);
   const adminCheck = adminRequired(auth.user);
   if (adminCheck.error) return error(adminCheck.error, adminCheck.status);
-  const rejected = db.pending_profiles.reject(reviewId);
+  const rejected = await db.pending_profiles.reject(reviewId);
   if (!rejected) return error('审核记录不存在', 404);
   return json({ message: '已驳回审核' });
 }
@@ -196,17 +196,17 @@ async function handleFdeReviewUpdate(request, reviewId) {
   if (auth.error) return error(auth.error, auth.status);
   const adminCheck = adminRequired(auth.user);
   if (adminCheck.error) return error(adminCheck.error, adminCheck.status);
-  const review = db.pending_profiles.findById(reviewId);
+  const review = await db.pending_profiles.findById(reviewId);
   if (!review) return error('审核记录不存在', 404);
   const body = await parseBody(request);
   const { name, title, city, description, work_details, resources_needed, skills, email, phone, avatar_url, wechat_qr_url } = body;
-  const updated = db.pending_profiles.update(reviewId, { name, title, city, description, work_details, resources_needed, skills, email, phone, avatar_url, wechat_qr_url });
+  const updated = await db.pending_profiles.update(reviewId, { name, title, city, description, work_details, resources_needed, skills, email, phone, avatar_url, wechat_qr_url });
   return json(updated);
 }
 
 async function handleFdeGetProfile(userId) {
   if (isNaN(userId)) return error('FDE 信息不存在', 404);
-  const profile = db.fde_profiles.findByUserId(userId);
+  const profile = await db.fde_profiles.findByUserId(userId);
   if (!profile) return error('FDE 信息不存在', 404);
   return json(profile);
 }
@@ -220,16 +220,16 @@ async function handleFdeUpdateProfile(request, userId) {
   const { name, title, city, description, work_details, resources_needed, skills, email, phone, wechat_qr_url } = body;
   const fields = { name, title, city, description, work_details, resources_needed, skills, email, phone };
   if (auth.user.role === 'admin') {
-    const updated = db.fde_profiles.update(userId, fields);
+    const updated = await db.fde_profiles.update(userId, fields);
     if (!updated) return error('FDE 信息不存在', 404);
     if (wechat_qr_url !== undefined && (wechat_qr_url === '' || wechat_qr_url === null)) {
-      db.fde_profiles.updateQrCode(userId, '');
+      await db.fde_profiles.updateQrCode(userId, '');
     }
-    return json({ ...db.fde_profiles.findByUserId(userId), reviewed: true });
+    return json({ ...(await db.fde_profiles.findByUserId(userId)), reviewed: true });
   }
   // Non-admin: save to pending
-  const current = db.fde_profiles.findByUserId(userId);
-  const existingReview = db.pending_profiles.findByUserId(userId);
+  const current = await db.fde_profiles.findByUserId(userId);
+  const existingReview = await db.pending_profiles.findByUserId(userId);
   const merged = {
     name: name !== undefined ? name : (existingReview?.profile_data?.name ?? current?.name ?? ''),
     title: title !== undefined ? title : (existingReview?.profile_data?.title ?? current?.title ?? ''),
@@ -242,8 +242,8 @@ async function handleFdeUpdateProfile(request, userId) {
     phone: phone !== undefined ? phone : (existingReview?.profile_data?.phone ?? current?.phone ?? ''),
     wechat_qr_url: wechat_qr_url !== undefined ? (wechat_qr_url || '') : (existingReview?.profile_data?.wechat_qr_url ?? current?.wechat_qr_url ?? '')
   };
-  db.pending_profiles.create({ user_id: userId, profile_data: merged });
-  const profile = db.fde_profiles.findByUserId(userId);
+  await db.pending_profiles.create({ user_id: userId, profile_data: merged });
+  const profile = await db.fde_profiles.findByUserId(userId);
   return json({ ...profile, reviewed: false, message: '已提交审核，请等待管理员审核' });
 }
 
@@ -252,7 +252,7 @@ async function handleFdeDeleteProfile(request, userId) {
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
   if (auth.user.role !== 'admin') return error('仅管理员可删除 FDE 信息', 403);
-  const deleted = db.fde_profiles.delete(userId);
+  const deleted = await db.fde_profiles.delete(userId);
   if (!deleted) return error('FDE 信息不存在', 404);
   return json({ success: true, message: '已删除' });
 }
@@ -266,11 +266,11 @@ async function handleFdeUploadAvatar(request, userId) {
   const avatarData = body.avatar;
   if (!avatarData) return error('请上传图片');
   if (auth.user.role === 'admin') {
-    db.fde_profiles.updateAvatar(userId, avatarData);
+    await db.fde_profiles.updateAvatar(userId, avatarData);
     return json({ url: avatarData, reviewed: true });
   }
-  const current = db.fde_profiles.findByUserId(userId);
-  const existingReview = db.pending_profiles.findByUserId(userId);
+  const current = await db.fde_profiles.findByUserId(userId);
+  const existingReview = await db.pending_profiles.findByUserId(userId);
   const profile_data = existingReview?.profile_data || {
     name: current?.name || '', title: current?.title || '', city: current?.city || '',
     description: current?.description || '', work_details: current?.work_details || '',
@@ -279,7 +279,7 @@ async function handleFdeUploadAvatar(request, userId) {
     wechat_qr_url: current?.wechat_qr_url || ''
   };
   profile_data.avatar_url = avatarData;
-  db.pending_profiles.create({ user_id: userId, profile_data });
+  await db.pending_profiles.create({ user_id: userId, profile_data });
   return json({ url: avatarData, reviewed: false, message: '头像已提交审核' });
 }
 
@@ -292,11 +292,11 @@ async function handleFdeUploadQrCode(request, userId) {
   const qrData = body.qrcode;
   if (!qrData) return error('请上传图片');
   if (auth.user.role === 'admin') {
-    db.fde_profiles.updateQrCode(userId, qrData);
+    await db.fde_profiles.updateQrCode(userId, qrData);
     return json({ url: qrData, reviewed: true });
   }
-  const current = db.fde_profiles.findByUserId(userId);
-  const existingReview = db.pending_profiles.findByUserId(userId);
+  const current = await db.fde_profiles.findByUserId(userId);
+  const existingReview = await db.pending_profiles.findByUserId(userId);
   const profile_data = existingReview?.profile_data || {
     name: current?.name || '', title: current?.title || '', city: current?.city || '',
     description: current?.description || '', work_details: current?.work_details || '',
@@ -305,7 +305,7 @@ async function handleFdeUploadQrCode(request, userId) {
     avatar_url: current?.avatar_url || ''
   };
   profile_data.wechat_qr_url = qrData;
-  db.pending_profiles.create({ user_id: userId, profile_data });
+  await db.pending_profiles.create({ user_id: userId, profile_data });
   return json({ url: qrData, reviewed: false, message: '二维码已提交审核' });
 }
 
@@ -313,15 +313,15 @@ async function handleFdeUploadQrCode(request, userId) {
 
 async function handleArticlesList(request) {
   const { category, page, limit } = getQueryParams(request.url);
-  return json(db.articles.findAll({ category, page: parseInt(page) || 1, limit: parseInt(limit) || 12 }));
+  return json(await db.articles.findAll({ category, page: parseInt(page) || 1, limit: parseInt(limit) || 12 }));
 }
 
 async function handleArticlesCategories() {
-  return json(db.articles.getCategories());
+  return json(await db.articles.getCategories());
 }
 
 async function handleArticleGet(id) {
-  const article = db.articles.findById(id);
+  const article = await db.articles.findById(id);
   if (!article) return error('文章不存在', 404);
   return json(article);
 }
@@ -332,29 +332,29 @@ async function handleArticleCreate(request) {
   const body = await parseBody(request);
   const { title, summary, content, category } = body;
   if (!title || !content) return error('标题和内容不能为空');
-  const article = db.articles.create({ author_id: auth.user.id, title, summary, content, category });
+  const article = await db.articles.create({ author_id: auth.user.id, title, summary, content, category });
   return json(article, 201);
 }
 
 async function handleArticleUpdate(request, id) {
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
-  const article = db.articles.findById(id);
+  const article = await db.articles.findById(id);
   if (!article) return error('文章不存在', 404);
   if (auth.user.role !== 'admin' && auth.user.id !== article.author_id) return error('只能修改自己的文章', 403);
   const body = await parseBody(request);
   const { title, summary, content, category } = body;
-  const updated = db.articles.update(id, { title, summary, content, category });
+  const updated = await db.articles.update(id, { title, summary, content, category });
   return json(updated);
 }
 
 async function handleArticleDelete(request, id) {
   const auth = authRequired(request);
   if (auth.error) return error(auth.error, auth.status);
-  const article = db.articles.findById(id);
+  const article = await db.articles.findById(id);
   if (!article) return error('文章不存在', 404);
   if (auth.user.role !== 'admin' && auth.user.id !== article.author_id) return error('只能删除自己的文章', 403);
-  db.articles.delete(id);
+  await db.articles.delete(id);
   return json({ message: '文章已删除' });
 }
 
@@ -449,9 +449,14 @@ const SPA_HTML = `<!DOCTYPE html>
 
 async function onRequest(context) {
   const { request } = context;
-  const url = new URL(request.url);
+  const urlStr = request.url;
+  // EdgeOne may provide relative URLs; ensure we have a valid absolute URL
+  const url = new URL(urlStr.startsWith('http') ? urlStr : 'http://localhost' + urlStr);
   const path = url.pathname;
   const method = request.method.toUpperCase();
+
+  // Ensure admin account exists on first cold start
+  await db.ensureDefaults();
 
   // CORS preflight
   if (method === 'OPTIONS') {

@@ -1,0 +1,77 @@
+-- ============================================================
+-- FDE Platform - Supabase Database Schema
+-- 请在 Supabase 控制台 → SQL Editor 中执行此脚本
+-- ============================================================
+
+-- 用户表
+CREATE TABLE IF NOT EXISTS users (
+  id SERIAL PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  email TEXT DEFAULT '',
+  role TEXT DEFAULT 'user' CHECK (role IN ('user', 'admin')),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- FDE 资料表
+CREATE TABLE IF NOT EXISTS fde_profiles (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT DEFAULT '',
+  title TEXT DEFAULT '',
+  city TEXT DEFAULT '',
+  description TEXT DEFAULT '',
+  work_details TEXT DEFAULT '',
+  resources_needed TEXT DEFAULT '',
+  skills TEXT DEFAULT '',
+  avatar_url TEXT DEFAULT '',
+  wechat_qr_url TEXT DEFAULT '',
+  email TEXT DEFAULT '',
+  phone TEXT DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 待审核 FDE 资料表
+CREATE TABLE IF NOT EXISTS pending_profiles (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  profile_data JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 文章表
+CREATE TABLE IF NOT EXISTS articles (
+  id SERIAL PRIMARY KEY,
+  author_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  summary TEXT DEFAULT '',
+  content TEXT DEFAULT '',
+  category TEXT DEFAULT '技术分享',
+  cover_url TEXT DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 索引
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+CREATE INDEX IF NOT EXISTS idx_fde_profiles_user_id ON fde_profiles(user_id);
+CREATE INDEX IF NOT EXISTS idx_fde_profiles_city ON fde_profiles(city);
+CREATE INDEX IF NOT EXISTS idx_pending_profiles_user_id ON pending_profiles(user_id);
+CREATE INDEX IF NOT EXISTS idx_articles_author_id ON articles(author_id);
+CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category);
+CREATE INDEX IF NOT EXISTS idx_articles_created_at ON articles(created_at DESC);
+
+-- 启用 RLS（Row Level Security）
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fde_profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pending_profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE articles ENABLE ROW LEVEL SECURITY;
+
+-- RLS 策略：允许服务端（使用 anon key）完全访问所有表
+-- 因为 EdgeOne Edge Function 在后端运行，使用 service_role 或 anon key 直接操作
+CREATE POLICY "Allow all access via backend" ON users FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all access via backend" ON fde_profiles FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all access via backend" ON pending_profiles FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all access via backend" ON articles FOR ALL USING (true) WITH CHECK (true);
