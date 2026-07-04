@@ -54,6 +54,42 @@ export default async function onRequest(context) {
 
   function now() { return new Date().toISOString(); }
 
+  // ---- polyfill: atob / btoa (not available in all edge runtimes) ----
+  var B64CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+  function _safeBtoa(str) {
+    var out = '', i = 0, c1, c2, c3;
+    while (i < str.length) {
+      c1 = str.charCodeAt(i++) & 0xff;
+      if (i === str.length) { out += B64CHARS.charAt(c1 >> 2) + B64CHARS.charAt((c1 & 0x3) << 4) + '=='; break; }
+      c2 = str.charCodeAt(i++);
+      if (i === str.length) { out += B64CHARS.charAt(c1 >> 2) + B64CHARS.charAt(((c1 & 0x3) << 4) | ((c2 & 0xf0) >> 4)) + B64CHARS.charAt((c2 & 0xf) << 2) + '='; break; }
+      c3 = str.charCodeAt(i++);
+      out += B64CHARS.charAt(c1 >> 2) + B64CHARS.charAt(((c1 & 0x3) << 4) | ((c2 & 0xf0) >> 4)) + B64CHARS.charAt(((c2 & 0xf) << 2) | ((c3 & 0xc0) >> 6)) + B64CHARS.charAt(c3 & 0x3f);
+    }
+    return out;
+  }
+  function _safeAtob(b64) {
+    b64 = b64.replace(/[^A-Za-z0-9\+\/\=]/g, '');
+    var out = '', i = 0, c1, c2, c3, e1, e2, e3, e4;
+    while (i < b64.length) {
+      e1 = B64CHARS.indexOf(b64.charAt(i++));
+      e2 = B64CHARS.indexOf(b64.charAt(i++));
+      e3 = B64CHARS.indexOf(b64.charAt(i++));
+      e4 = B64CHARS.indexOf(b64.charAt(i++));
+      c1 = (e1 << 2) | (e2 >> 4);
+      out += String.fromCharCode(c1);
+      if (e3 !== 64) {
+        c2 = ((e2 & 15) << 4) | (e3 >> 2);
+        out += String.fromCharCode(c2);
+      }
+      if (e4 !== 64) {
+        c3 = ((e3 & 3) << 6) | e4;
+        out += String.fromCharCode(c3);
+      }
+    }
+    return out;
+  }
+
   function tokenPayload(data) {
     var parts = [];
     Object.keys(data).forEach(function(k) { parts.push(k + '=' + encodeURIComponent(data[k])); });
@@ -64,14 +100,16 @@ export default async function onRequest(context) {
     var ts = Math.floor(Date.now() / 1000);
     var payload = tokenPayload({ i: String(user.id), u: user.username, r: user.role, t: String(ts) });
     var sig = hash(payload + '-JWT');
-    return 'v1.' + btoa(payload) + '.' + sig;
+    return 'v1.' + _safeBtoa(payload) + '.' + sig;
   }
 
   function verifyToken(token) {
+    if (!token) return null;
     var parts = token.split('.');
     if (parts.length !== 3) return null;
     var payload;
-    try { payload = atob(parts[1]); } catch(e) { return null; }
+    try { payload = _safeAtob(parts[1]); } catch(e) { return null; }
+    if (!payload || payload.indexOf('=') < 0) return null;
     var map = {};
     payload.split('&').forEach(function(p) {
       var kv = p.split('=');
@@ -86,7 +124,7 @@ export default async function onRequest(context) {
   function getAuth() {
     var header = '';
     try { header = request.headers.get('authorization') || ''; } catch(e) {}
-    if (!header.startsWith('Bearer ')) return null;
+    if (!header || !header.startsWith('Bearer ')) return null;
     return verifyToken(header.substring(7));
   }
 
@@ -123,7 +161,7 @@ export default async function onRequest(context) {
   async function ensureAdmin() {
     if (_seeded) return;
     try {
-      var check = await supabaseREST('users', 'GET', null, ['select=count', 'role=eq.admin']);
+      var check = await supabaseREST('users', 'GET', null, ['select=id', 'role=eq.admin']);
       var count = 0;
       if (!check.error && check.data && Array.isArray(check.data)) {
         count = check.data.length;
@@ -165,6 +203,18 @@ export default async function onRequest(context) {
     return json({ ok: true, message: '管理员账号已初始化', account: 'admin / 217310Was@' });
   }
 
+  // /api/token-test — 测试 token 生成和验证
+  if (path === '/api/token-test' && method === 'GET') {
+    var testUser = { id: 1, username: 'test', role: 'admin' };
+    var token = signToken(testUser);
+    var verified = verifyToken(token);
+    return json({
+      signed_token: token,
+      verified: verified ? { id: verified.id, username: verified.username, role: verified.role } : null,
+      match: verified && verified.id === testUser.id
+    });
+  }
+
   // /api/health
   if (path === '/api/health' && method === 'GET') {
     return json({
@@ -184,7 +234,7 @@ export default async function onRequest(context) {
     var diag = { sb_url: SB_URL, sb_key_prefix: SB_KEY.substring(0, 20) + '...' };
 
     // Test 1: 检查 users 表是否存在并能否查询
-    var t1 = await supabaseREST('users', 'GET', null, ['select=count']);
+    var t1 = await supabaseREST('users', 'GET', null, ['select=id']);
     diag.test_users_table = {
       ok: !t1.error,
       status: t1.status || (t1.error ? 'error' : 'ok'),
