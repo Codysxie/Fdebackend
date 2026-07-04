@@ -117,7 +117,53 @@ export default async function onRequest(context) {
     }
   }
 
+  // ====== Seed admin account ======
+  // 首次访问自动创建管理员账号，避免空数据库无法登录
+  var _seeded = false;
+  async function ensureAdmin() {
+    if (_seeded) return;
+    try {
+      var check = await supabaseREST('users', 'GET', null, ['select=count', 'role=eq.admin']);
+      var count = 0;
+      if (!check.error && check.data && Array.isArray(check.data)) {
+        count = check.data.length;
+      }
+      if (count === 0) {
+        var cr = await supabaseREST('users', 'POST', {
+          username: 'admin',
+          password_hash: hash('217310Was@'),
+          email: 'admin@fde.com',
+          role: 'admin',
+          created_at: now()
+        }, ['select=*']);
+        if (!cr.error) {
+          var u = Array.isArray(cr.data) ? cr.data[0] : cr.data;
+          if (u && u.id) {
+            await supabaseREST('fde_profiles', 'POST', {
+              user_id: u.id,
+              name: '管理员',
+              title: '系统管理员',
+              city: '深圳',
+              description: 'FDE 平台管理员',
+              email: 'admin@fde.com',
+              created_at: now(),
+              updated_at: now()
+            });
+          }
+        }
+      }
+    } catch(e) {}
+    _seeded = true;
+  }
+
   // ====== API handlers ======
+
+  // /api/seed — 手动初始化管理员账号
+  if (path === '/api/seed' && method === 'GET') {
+    _seeded = false;
+    await ensureAdmin();
+    return json({ ok: true, message: '管理员账号已初始化', account: 'admin / 217310Was@' });
+  }
 
   // /api/health
   if (path === '/api/health' && method === 'GET') {
@@ -158,8 +204,11 @@ export default async function onRequest(context) {
     return json(diag);
   }
 
+  // ====== Auth endpoints (already working) ======
+
   // /api/auth/login
   if (path === '/api/auth/login' && method === 'POST') {
+    await ensureAdmin();
     var body = await parseBody();
     if (!body.username || !body.password) return json({ error: '用户名和密码不能为空' }, 400);
 
@@ -228,6 +277,7 @@ export default async function onRequest(context) {
 
   // /api/auth/me
   if (path === '/api/auth/me' && method === 'GET') {
+    await ensureAdmin();
     var auth = getAuth();
     if (!auth) return json({ error: '请先登录' }, 401);
 
@@ -236,6 +286,409 @@ export default async function onRequest(context) {
     var users = Array.isArray(r.data) ? r.data : [r.data];
     if (users.length === 0) return json({ error: '用户不存在' }, 404);
     return json(users[0]);
+  }
+
+  // ====== Auth: change password ======
+  // PUT /api/auth/password
+  if (path === '/api/auth/password' && method === 'PUT') {
+    var auth = getAuth();
+    if (!auth) return json({ error: '请先登录' }, 401);
+    var body = await parseBody();
+    if (!body.currentPassword || !body.newPassword) {
+      return json({ error: '当前密码和新密码不能为空' }, 400);
+    }
+
+    // Verify current password
+    var r = await supabaseREST('users', 'GET', null, ['select=password_hash', 'id=eq.' + auth.id]);
+    if (r.error) return json({ error: '查询失败' }, 500);
+    var users = Array.isArray(r.data) ? r.data : [r.data];
+    if (users.length === 0 || users[0].password_hash !== hash(body.currentPassword)) {
+      return json({ error: '当前密码不正确' }, 400);
+    }
+    // Update password
+    var up = await supabaseREST('users', 'PATCH', { password_hash: hash(body.newPassword) }, ['id=eq.' + auth.id]);
+    if (up.error) return json({ error: '修改密码失败' }, 500);
+    return json({ ok: true });
+  }
+
+  // ====== Auth: list users (admin) ======
+  // GET /api/auth/users
+  if (path === '/api/auth/users' && method === 'GET') {
+    var auth = getAuth();
+    if (!auth) return json({ error: '请先登录' }, 401);
+    if (auth.role !== 'admin') return json({ error: '权限不足' }, 403);
+    var r = await supabaseREST('users', 'GET', null, ['select=id,username,email,role,created_at', 'order=created_at.desc']);
+    if (r.error) return json({ error: '查询失败' }, 500);
+    return json(r.data || []);
+  }
+
+  // PUT /api/auth/users/:id/role
+  if (false) {} // placeholder for path matching below
+  var authUserPath = path.match(/^\/api\/auth\/users\/(\d+)\/role$/);
+  if (authUserPath && method === 'PUT') {
+    var auth = getAuth();
+    if (!auth) return json({ error: '请先登录' }, 401);
+    if (auth.role !== 'admin') return json({ error: '权限不足' }, 403);
+    var userId = parseInt(authUserPath[1]);
+    var body = await parseBody();
+    if (!body.role) return json({ error: 'role is required' }, 400);
+    var up = await supabaseREST('users', 'PATCH', { role: body.role }, ['id=eq.' + userId, 'select=id,username,email,role,created_at']);
+    if (up.error) return json({ error: '更新角色失败' }, 500);
+    var u = Array.isArray(up.data) ? up.data[0] : up.data;
+    return json(u);
+  }
+
+  // ====== FDE Profiles ======
+
+  // GET /api/fde/cities
+  if (path === '/api/fde/cities' && method === 'GET') {
+    var r = await supabaseREST('fde_profiles', 'GET', null, ['select=city']);
+    if (r.error) return json(r.error, 500);
+    var cities = [];
+    (r.data || []).forEach(function(p) { if (p.city && cities.indexOf(p.city) < 0) cities.push(p.city); });
+    cities.sort();
+    return json(cities);
+  }
+
+  // GET /api/fde — list profiles
+  if (path === '/api/fde' && method === 'GET') {
+    var params = url.searchParams;
+    var city = params.get('city') || '';
+    var qparts = ['select=*', 'order=updated_at.desc'];
+    if (city && city !== '全部' && city !== 'all') {
+      qparts.push('city=eq.' + encodeURIComponent(city));
+    }
+    var r = await supabaseREST('fde_profiles', 'GET', null, qparts);
+    if (r.error) return json({ error: '查询失败' }, 500);
+    var profiles = r.data || [];
+    // Enrich with username/role from users table
+    if (profiles.length > 0) {
+      var userIds = [];
+      profiles.forEach(function(p) { if (p.user_id && userIds.indexOf(p.user_id) < 0) userIds.push(p.user_id); });
+      if (userIds.length > 0) {
+        var uRes = await supabaseREST('users', 'GET', null, ['select=id,username,role', 'id=in.(' + userIds.join(',') + ')']);
+        var userMap = {};
+        if (!uRes.error && uRes.data) { (Array.isArray(uRes.data) ? uRes.data : [uRes.data]).forEach(function(u) { userMap[u.id] = u; }); }
+        profiles = profiles.map(function(p) {
+          var um = userMap[p.user_id] || {};
+          p.username = um.username || '';
+          p.role = um.role || 'user';
+          return p;
+        });
+      }
+    }
+    return json(profiles);
+  }
+
+  // GET /api/fde/my-pending
+  if (path === '/api/fde/my-pending' && method === 'GET') {
+    var auth = getAuth();
+    if (!auth) return json({ error: '请先登录' }, 401);
+    var r = await supabaseREST('pending_profiles', 'GET', null, ['select=*', 'user_id=eq.' + auth.id]);
+    if (r.error) return json({ error: '查询失败' }, 500);
+    var data = Array.isArray(r.data) ? r.data : [r.data];
+    return json(data.length > 0 ? data[0] : null);
+  }
+
+  // GET /api/fde/reviews
+  if (path === '/api/fde/reviews' && method === 'GET') {
+    var auth = getAuth();
+    if (!auth) return json({ error: '请先登录' }, 401);
+    if (auth.role !== 'admin') return json({ error: '权限不足' }, 403);
+    var r = await supabaseREST('pending_profiles', 'GET', null, ['select=*', 'order=created_at.desc']);
+    if (r.error) return json({ error: '查询失败' }, 500);
+    var reviews = r.data || [];
+    // Enrich with username + current profile
+    if (reviews.length > 0) {
+      var userIds2 = [];
+      reviews.forEach(function(rev) { if (rev.user_id && userIds2.indexOf(rev.user_id) < 0) userIds2.push(rev.user_id); });
+      if (userIds2.length > 0) {
+        var uRes2 = await supabaseREST('users', 'GET', null, ['select=id,username,role', 'id=in.(' + userIds2.join(',') + ')']);
+        var pRes = await supabaseREST('fde_profiles', 'GET', null, ['select=*', 'user_id=in.(' + userIds2.join(',') + ')']);
+        var userMap2 = {};
+        if (!uRes2.error && uRes2.data) { (Array.isArray(uRes2.data) ? uRes2.data : [uRes2.data]).forEach(function(u) { userMap2[u.id] = u; }); }
+        var profileMap = {};
+        if (!pRes.error && pRes.data) { (Array.isArray(pRes.data) ? pRes.data : [pRes.data]).forEach(function(p) { profileMap[p.user_id] = p; }); }
+        reviews = reviews.map(function(rev) {
+          rev.username = (userMap2[rev.user_id] || {}).username || '';
+          rev.role = (userMap2[rev.user_id] || {}).role || 'user';
+          rev.current_profile = profileMap[rev.user_id] || null;
+          return rev;
+        });
+      }
+    }
+    return json(reviews);
+  }
+
+  // PUT /api/fde/reviews/:id/approve
+  var approveMatch = path.match(/^\/api\/fde\/reviews\/(\d+)\/approve$/);
+  if (approveMatch && method === 'PUT') {
+    var auth = getAuth();
+    if (!auth) return json({ error: '请先登录' }, 401);
+    if (auth.role !== 'admin') return json({ error: '权限不足' }, 403);
+    var reviewId = parseInt(approveMatch[1]);
+    var rev = await supabaseREST('pending_profiles', 'GET', null, ['select=*', 'id=eq.' + reviewId]);
+    if (rev.error) return json({ error: '查询审批记录失败' }, 500);
+    var revData = Array.isArray(rev.data) ? rev.data[0] : rev.data;
+    if (!revData) return json({ error: '审批记录不存在' }, 404);
+    // Apply profile changes
+    var pd = revData.profile_data || {};
+    await supabaseREST('fde_profiles', 'PATCH', Object.assign({}, pd, { updated_at: now() }), ['user_id=eq.' + revData.user_id]);
+    // Delete pending record
+    await supabaseREST('pending_profiles', 'DELETE', null, ['id=eq.' + reviewId]);
+    return json({ ok: true });
+  }
+
+  // PUT /api/fde/reviews/:id/reject
+  var rejectMatch = path.match(/^\/api\/fde\/reviews\/(\d+)\/reject$/);
+  if (rejectMatch && method === 'PUT') {
+    var auth = getAuth();
+    if (!auth) return json({ error: '请先登录' }, 401);
+    if (auth.role !== 'admin') return json({ error: '权限不足' }, 403);
+    var reviewId = parseInt(rejectMatch[1]);
+    await supabaseREST('pending_profiles', 'DELETE', null, ['id=eq.' + reviewId]);
+    return json({ ok: true });
+  }
+
+  // GET/PUT /api/fde/reviews/:id
+  var reviewSingle = path.match(/^\/api\/fde\/reviews\/(\d+)$/);
+  if (reviewSingle) {
+    if (method === 'GET') {
+      var auth = getAuth();
+      if (!auth) return json({ error: '请先登录' }, 401);
+      var reviewId = parseInt(reviewSingle[1]);
+      var rev = await supabaseREST('pending_profiles', 'GET', null, ['select=*', 'id=eq.' + reviewId]);
+      if (rev.error) return json({ error: '查询失败' }, 500);
+      var data = Array.isArray(rev.data) ? rev.data[0] : rev.data;
+      return json(data || null);
+    }
+    if (method === 'PUT') {
+      var auth = getAuth();
+      if (!auth) return json({ error: '请先登录' }, 401);
+      var reviewId = parseInt(reviewSingle[1]);
+      var body = await parseBody();
+      var existing = await supabaseREST('pending_profiles', 'GET', null, ['select=*', 'id=eq.' + reviewId]);
+      var existingData = Array.isArray(existing.data) ? existing.data[0] : existing.data;
+      if (!existingData) return json({ error: '记录不存在' }, 404);
+      // Only allow updating if user matches
+      if (auth.role !== 'admin' && existingData.user_id !== auth.id) {
+        return json({ error: '权限不足' }, 403);
+      }
+      var up = await supabaseREST('pending_profiles', 'PATCH', { profile_data: Object.assign({}, existingData.profile_data, body) }, ['id=eq.' + reviewId, 'select=*']);
+      if (up.error) return json({ error: '更新失败' }, 500);
+      var ud = Array.isArray(up.data) ? up.data[0] : up.data;
+      return json(ud);
+    }
+  }
+
+  // GET/PUT /api/fde/:userId
+  var fdeUserMatch = path.match(/^\/api\/fde\/(\d+)$/);
+  if (fdeUserMatch) {
+    var fdeUserId = parseInt(fdeUserMatch[1]);
+
+    if (method === 'GET') {
+      var r = await supabaseREST('fde_profiles', 'GET', null, ['select=*', 'user_id=eq.' + fdeUserId]);
+      if (r.error) return json({ error: '查询失败' }, 500);
+      var data = Array.isArray(r.data) ? r.data[0] : r.data;
+      // Enrich with username/role
+      if (data) {
+        var uRes = await supabaseREST('users', 'GET', null, ['select=id,username,role', 'id=eq.' + fdeUserId]);
+        if (!uRes.error && uRes.data) {
+          var uData = Array.isArray(uRes.data) ? uRes.data[0] : uRes.data;
+          if (uData) { data.username = uData.username || ''; data.role = uData.role || 'user'; }
+        }
+        // Check hasPending
+        var pend = await supabaseREST('pending_profiles', 'GET', null, ['select=user_id', 'user_id=eq.' + fdeUserId]);
+        data.hasPending = !pend.error && pend.data && pend.data.length > 0;
+      }
+      return json(data || null);
+    }
+
+    if (method === 'PUT') {
+      var auth = getAuth();
+      if (!auth) return json({ error: '请先登录' }, 401);
+      // User can only update their own profile, admin can update any
+      if (auth.role !== 'admin' && auth.id !== fdeUserId) {
+        return json({ error: '权限不足' }, 403);
+      }
+      var body = await parseBody();
+      // Upsert: ensure profile exists
+      var exists = await supabaseREST('fde_profiles', 'GET', null, ['select=id', 'user_id=eq.' + fdeUserId]);
+      var existsData = Array.isArray(exists.data) ? exists.data : (exists.data ? [exists.data] : []);
+      if (existsData.length === 0) {
+        // Create profile
+        var createBody = Object.assign({
+          user_id: fdeUserId, name: '', email: '', created_at: now(), updated_at: now()
+        }, body);
+        var cr = await supabaseREST('fde_profiles', 'POST', createBody, ['select=*']);
+        if (cr.error) return json({ error: '创建资料失败' }, 500);
+        var cd = Array.isArray(cr.data) ? cr.data[0] : cr.data;
+        return json(cd);
+      } else {
+        // Check if there's a pending review for this user
+        var pendingCheck = await supabaseREST('pending_profiles', 'GET', null, ['select=id,user_id', 'user_id=eq.' + fdeUserId]);
+        var hasPending = !pendingCheck.error && pendingCheck.data && pendingCheck.data.length > 0;
+
+        if (auth.role !== 'admin' && hasPending) {
+          // Non-admin with pending: update pending record instead
+          var uRe = await supabaseREST('pending_profiles', 'PATCH', {
+            profile_data: body, created_at: now()
+          }, ['user_id=eq.' + fdeUserId, 'select=*']);
+          if (uRe.error) return json({ error: '更新待审核资料失败' }, 500);
+          var uReData = Array.isArray(uRe.data) ? uRe.data[0] : uRe.data;
+          return json(uReData);
+        }
+
+        // Update profile directly
+        var updateBody = Object.assign({}, body, { updated_at: now() });
+        var up = await supabaseREST('fde_profiles', 'PATCH', updateBody, ['user_id=eq.' + fdeUserId, 'select=*']);
+        if (up.error) return json({ error: '更新资料失败' }, 500);
+        var ud = Array.isArray(up.data) ? up.data[0] : up.data;
+        return json(ud);
+      }
+    }
+  }
+
+  // POST /api/fde/:userId/avatar
+  var avatarMatch = path.match(/^\/api\/fde\/(\d+)\/avatar$/);
+  if (avatarMatch && method === 'POST') {
+    var auth = getAuth();
+    if (!auth) return json({ error: '请先登录' }, 401);
+    var fdeUserId = parseInt(avatarMatch[1]);
+    if (auth.role !== 'admin' && auth.id !== fdeUserId) return json({ error: '权限不足' }, 403);
+    // In edge functions we can't handle file uploads easily, return placeholder
+    return json({ error: 'Edge function 暂不支持文件上传，请使用 Supabase Storage 直传' }, 501);
+  }
+
+  // POST /api/fde/:userId/qrcode
+  var qrMatch = path.match(/^\/api\/fde\/(\d+)\/qrcode$/);
+  if (qrMatch && method === 'POST') {
+    var auth = getAuth();
+    if (!auth) return json({ error: '请先登录' }, 401);
+    var fdeUserId = parseInt(qrMatch[1]);
+    if (auth.role !== 'admin' && auth.id !== fdeUserId) return json({ error: '权限不足' }, 403);
+    return json({ error: 'Edge function 暂不支持文件上传，请使用 Supabase Storage 直传' }, 501);
+  }
+
+  // ====== Articles ======
+
+  // GET /api/articles/categories
+  if (path === '/api/articles/categories' && method === 'GET') {
+    var r = await supabaseREST('articles', 'GET', null, ['select=category']);
+    if (r.error) return json({ error: '查询失败' }, 500);
+    var cats = [];
+    (r.data || []).forEach(function(a) { if (a.category && cats.indexOf(a.category) < 0) cats.push(a.category); });
+    cats.sort();
+    return json(cats);
+  }
+
+  // GET/POST /api/articles
+  if (path === '/api/articles' && method === 'GET') {
+    var params = url.searchParams;
+    var category = params.get('category') || '';
+    var page = parseInt(params.get('page')) || 1;
+    var limit = parseInt(params.get('limit')) || 12;
+    var qparts = ['select=*', 'order=created_at.desc'];
+    if (category && category !== '全部') qparts.push('category=eq.' + encodeURIComponent(category));
+    // Use Range header for pagination
+    var extraHeaders = {};
+    var start = (page - 1) * limit;
+    var end = start + limit - 1;
+    extraHeaders['Range'] = start + '-' + end;
+    extraHeaders['Prefer'] = 'count=exact';
+    var url = SB_URL + '/rest/v1/articles?' + qparts.join('&');
+    var resp = await fetch(url, {
+      headers: { 'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY, 'Range': extraHeaders['Range'], 'Prefer': extraHeaders['Prefer'] }
+    });
+    var total = 0;
+    var cr = resp.headers.get('content-range');
+    if (cr) { var m2 = cr.match(/\/(\d+)/); if (m2) total = parseInt(m2[1]); }
+    var text = await resp.text();
+    var articles = [];
+    try { articles = JSON.parse(text); } catch(e) {}
+    if (!Array.isArray(articles)) articles = [];
+    // Enrich with author names
+    if (articles.length > 0) {
+      var authorIds = [];
+      articles.forEach(function(a) { if (a.author_id && authorIds.indexOf(a.author_id) < 0) authorIds.push(a.author_id); });
+      if (authorIds.length > 0) {
+        var uRes = await supabaseREST('users', 'GET', null, ['select=id,username', 'id=in.(' + authorIds.join(',') + ')']);
+        var userMap = {};
+        if (!uRes.error && uRes.data) { (Array.isArray(uRes.data) ? uRes.data : [uRes.data]).forEach(function(u) { userMap[u.id] = u; }); }
+        articles = articles.map(function(a) { a.author_name = (userMap[a.author_id] || {}).username || '未知'; return a; });
+      }
+    }
+    return json({ articles: articles, total: total, page: page, totalPages: Math.max(1, Math.ceil(total / limit)) });
+  }
+
+  if (path === '/api/articles' && method === 'POST') {
+    var auth = getAuth();
+    if (!auth) return json({ error: '请先登录' }, 401);
+    var body = await parseBody();
+    if (!body.title || !body.content) return json({ error: '标题和内容不能为空' }, 400);
+    var cr = await supabaseREST('articles', 'POST', {
+      author_id: auth.id,
+      title: body.title,
+      summary: body.summary || '',
+      content: body.content,
+      category: body.category || '技术分享',
+      cover_url: body.cover_url || ''
+    }, ['select=*']);
+    if (cr.error) return json({ error: '创建文章失败' }, 500);
+    var article = Array.isArray(cr.data) ? cr.data[0] : cr.data;
+    article.author_name = auth.username;
+    return json(article);
+  }
+
+  // GET/PUT/DELETE /api/articles/:id
+  var articleMatch = path.match(/^\/api\/articles\/(\d+)$/);
+  if (articleMatch) {
+    var articleId = parseInt(articleMatch[1]);
+
+    if (method === 'GET') {
+      var r = await supabaseREST('articles', 'GET', null, ['select=*', 'id=eq.' + articleId]);
+      if (r.error) return json({ error: '查询失败' }, 500);
+      var data = Array.isArray(r.data) ? r.data[0] : r.data;
+      if (!data) return json({ error: '文章不存在' }, 404);
+      var uRes = await supabaseREST('users', 'GET', null, ['select=username', 'id=eq.' + (data.author_id || 0)]);
+      data.author_name = (!uRes.error && uRes.data && uRes.data.length > 0) ? uRes.data[0].username : '未知';
+      return json(data);
+    }
+
+    if (method === 'PUT') {
+      var auth = getAuth();
+      if (!auth) return json({ error: '请先登录' }, 401);
+      var body = await parseBody();
+      // Verify ownership or admin
+      var existing = await supabaseREST('articles', 'GET', null, ['select=author_id', 'id=eq.' + articleId]);
+      var existingData = Array.isArray(existing.data) ? existing.data[0] : existing.data;
+      if (!existingData) return json({ error: '文章不存在' }, 404);
+      if (auth.role !== 'admin' && existingData.author_id !== auth.id) return json({ error: '权限不足' }, 403);
+      var updateBody = Object.assign({}, body, { updated_at: now() });
+      var up = await supabaseREST('articles', 'PATCH', updateBody, ['id=eq.' + articleId, 'select=*']);
+      if (up.error) return json({ error: '更新文章失败' }, 500);
+      var ud = Array.isArray(up.data) ? up.data[0] : up.data;
+      ud.author_name = auth.username;
+      return json(ud);
+    }
+
+    if (method === 'DELETE') {
+      var auth = getAuth();
+      if (!auth) return json({ error: '请先登录' }, 401);
+      var existing = await supabaseREST('articles', 'GET', null, ['select=author_id', 'id=eq.' + articleId]);
+      var existingData = Array.isArray(existing.data) ? existing.data[0] : existing.data;
+      if (!existingData) return json({ error: '文章不存在' }, 404);
+      if (auth.role !== 'admin' && existingData.author_id !== auth.id) return json({ error: '权限不足' }, 403);
+      await supabaseREST('articles', 'DELETE', null, ['id=eq.' + articleId]);
+      return json({ ok: true });
+    }
+  }
+
+  // POST /api/articles/upload-cover
+  if (path === '/api/articles/upload-cover' && method === 'POST') {
+    var auth = getAuth();
+    if (!auth) return json({ error: '请先登录' }, 401);
+    return json({ error: 'Edge function 暂不支持文件上传，请使用 Supabase Storage 直传' }, 501);
   }
 
   // SPA fallback

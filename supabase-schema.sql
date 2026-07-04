@@ -75,3 +75,15 @@ CREATE POLICY "Allow all access via backend" ON users FOR ALL USING (true) WITH 
 CREATE POLICY "Allow all access via backend" ON fde_profiles FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Allow all access via backend" ON pending_profiles FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Allow all access via backend" ON articles FOR ALL USING (true) WITH CHECK (true);
+
+-- 授予 anon 角色表级权限（RLS 策略只过滤行，表级权限需要单独授予）
+GRANT SELECT, INSERT, UPDATE, DELETE ON users TO anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON fde_profiles TO anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON pending_profiles TO anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON articles TO anon, authenticated;
+
+-- 授予序列使用权限（SERIAL 主键需要）
+GRANT USAGE ON SEQUENCE users_id_seq TO anon, authenticated;
+GRANT USAGE ON SEQUENCE fde_profiles_id_seq TO anon, authenticated;
+GRANT USAGE ON SEQUENCE pending_profiles_id_seq TO anon, authenticated;
+GRANT USAGE ON SEQUENCE articles_id_seq TO anon, authenticated;
