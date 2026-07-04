@@ -291,8 +291,53 @@ export default async function onRequest(context) {
       status: 'ok', timestamp: now(),
       supabase_url: SB_URL ? 'configured' : 'missing',
       supabase_key: SB_KEY ? 'configured' : 'missing',
-      version: 'edge-v2.1-review-fix'
+      version: 'edge-v2.2-approve-patch-fix'
     });
+  }
+
+  // /api/diag/approve-test — simulate approve flow to verify fde_profiles gets written
+  if (path === '/api/diag/approve-test' && method === 'GET') {
+    var diag = {};
+    var testUserId = -88888;
+    var testProfileData = { name: '__approve_test__', title: '测试', city: '深圳', description: '诊断测试' };
+
+    // 1. Ensure a test fde_profiles row doesn't exist from a previous run
+    await supabaseREST('fde_profiles', 'DELETE', null, ['user_id=eq.' + testUserId]);
+
+    // 2. Simulate what approve does: PATCH with user_id filter
+    var patchRes = await supabaseREST('fde_profiles', 'PATCH', Object.assign({}, testProfileData, { updated_at: now() }), ['user_id=eq.' + testUserId, 'select=*']);
+    diag.step1_patch = {
+      error: patchRes.error || null,
+      rowsAffected: patchRes.data ? (Array.isArray(patchRes.data) ? patchRes.data.length : 1) : 0
+    };
+
+    // 3. If PATCH returned 0 rows, fall back to INSERT
+    var rowsAffected = patchRes.data ? (Array.isArray(patchRes.data) ? patchRes.data.length : 1) : 0;
+    if (!patchRes.error && rowsAffected === 0) {
+      var insRes = await supabaseREST('fde_profiles', 'POST', Object.assign({
+        user_id: testUserId, created_at: now(), updated_at: now()
+      }, testProfileData), ['select=*']);
+      diag.step2_insert_fallback = {
+        error: insRes.error || null,
+        rowsInserted: insRes.data ? (Array.isArray(insRes.data) ? insRes.data.length : 1) : 0
+      };
+    } else {
+      diag.step2_insert_fallback = 'skipped (PATCH matched rows)';
+    }
+
+    // 4. Verify: read back from fde_profiles
+    var verify = await supabaseREST('fde_profiles', 'GET', null, ['select=*', 'user_id=eq.' + testUserId]);
+    diag.step3_verify = {
+      error: verify.error || null,
+      found: verify.data && verify.data.length > 0,
+      data: verify.data || null
+    };
+
+    // 5. Cleanup
+    await supabaseREST('fde_profiles', 'DELETE', null, ['user_id=eq.' + testUserId]);
+    diag.cleanup = 'done';
+
+    return json(diag);
   }
 
   // /api/diag/review-test — test pending_profiles table
@@ -418,14 +463,20 @@ export default async function onRequest(context) {
     var user = Array.isArray(cr.data) ? cr.data[0] : cr.data;
     if (!user || !user.id) return json({ error: '注册失败，未获取到用户信息' }, 500);
 
-    // Create empty profile
-    await supabaseREST('fde_profiles', 'POST', {
+    // Create empty profile (must succeed before we consider registration complete)
+    var pfRes = await supabaseREST('fde_profiles', 'POST', {
       user_id: user.id,
       name: body.username,
       email: body.email || '',
       created_at: now(),
       updated_at: now()
-    });
+    }, ['select=id']);
+    if (pfRes.error) {
+      // Profile creation failed — clean up the user we just created to avoid orphan accounts
+      await supabaseREST('users', 'DELETE', null, ['id=eq.' + user.id]);
+      var pfMsg = typeof pfRes.error === 'string' ? pfRes.error : JSON.stringify(pfRes.error);
+      return json({ error: '创建用户资料失败，注册已回滚 - ' + pfMsg }, 500);
+    }
 
     delete user.password_hash;
     return json({ token: signToken(user), user: user });
@@ -596,22 +647,57 @@ export default async function onRequest(context) {
       ? (Array.isArray(oldPr.data) ? oldPr.data[0] : oldPr.data) : {};
 
     // Apply profile changes — copy pending profile_data into live fde_profiles
+    // Strategy: PATCH first; if 0 rows matched (profile row doesn't exist), fall back to POST (INSERT)
     var pd = revData.profile_data || {};
-    var upPr = await supabaseREST('fde_profiles', 'PATCH', Object.assign({}, pd, { updated_at: now() }), ['user_id=eq.' + revData.user_id, 'select=*']);
+    var cleanPd = {};
+    var allowedFields = ['name','title','city','description','work_details','resources_needed','skills','avatar_url','wechat_qr_url','email','phone'];
+    allowedFields.forEach(function(k) { if (pd[k] !== undefined) cleanPd[k] = pd[k]; });
+
+    var upPr = await supabaseREST('fde_profiles', 'PATCH', Object.assign({}, cleanPd, { updated_at: now() }), ['user_id=eq.' + revData.user_id, 'select=*']);
+    var profileUpdated = false;
+    var profile = null;
+
+    if (upPr.error) {
+      // PATCH failed — don't delete pending, return error
+      return json({ error: '更新资料失败: ' + JSON.stringify(upPr.error) }, 500);
+    }
+
+    var patchResults = upPr.data || [];
+    if (patchResults.length > 0) {
+      // PATCH matched at least 1 row — success
+      profile = Array.isArray(patchResults) ? patchResults[0] : patchResults;
+      profileUpdated = true;
+    } else {
+      // PATCH returned 0 rows — fde_profiles row doesn't exist for this user, try INSERT
+      var insPr = await supabaseREST('fde_profiles', 'POST', Object.assign({
+        user_id: revData.user_id, created_at: now(), updated_at: now()
+      }, cleanPd), ['select=*']);
+      if (insPr.error) {
+        return json({ error: '创建资料失败: ' + JSON.stringify(insPr.error) }, 500);
+      }
+      var insResults = Array.isArray(insPr.data) ? insPr.data : (insPr.data ? [insPr.data] : []);
+      if (insResults.length > 0) {
+        profile = insResults[0];
+        profileUpdated = true;
+      } else {
+        return json({ error: '创建资料失败: 数据库返回空结果' }, 500);
+      }
+    }
+
+    if (!profileUpdated || !profile) {
+      return json({ error: '资料更新失败，请重试' }, 500);
+    }
 
     // Cleanup old files if URLs changed
-    if (oldProfile.avatar_url && pd.avatar_url && oldProfile.avatar_url !== pd.avatar_url) {
+    if (oldProfile.avatar_url && cleanPd.avatar_url && oldProfile.avatar_url !== cleanPd.avatar_url) {
       await deleteFromStorage(oldProfile.avatar_url);
     }
-    if (oldProfile.wechat_qr_url && pd.wechat_qr_url && oldProfile.wechat_qr_url !== pd.wechat_qr_url) {
+    if (oldProfile.wechat_qr_url && cleanPd.wechat_qr_url && oldProfile.wechat_qr_url !== cleanPd.wechat_qr_url) {
       await deleteFromStorage(oldProfile.wechat_qr_url);
     }
 
-    // Delete pending record
+    // Delete pending record (only after successful profile update)
     await supabaseREST('pending_profiles', 'DELETE', null, ['id=eq.' + reviewId]);
-    var profile = (!upPr.error && upPr.data && upPr.data.length > 0)
-      ? (Array.isArray(upPr.data) ? upPr.data[0] : upPr.data)
-      : {};
     return json({ message: '已通过审核', profile: profile });
   }
 
