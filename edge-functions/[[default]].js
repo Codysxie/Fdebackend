@@ -291,7 +291,7 @@ export default async function onRequest(context) {
       status: 'ok', timestamp: now(),
       supabase_url: SB_URL ? 'configured' : 'missing',
       supabase_key: SB_KEY ? 'configured' : 'missing',
-      version: 'edge-v2.2-approve-patch-fix'
+      version: 'edge-v2.3-register-pending-only'
     });
   }
 
@@ -463,19 +463,20 @@ export default async function onRequest(context) {
     var user = Array.isArray(cr.data) ? cr.data[0] : cr.data;
     if (!user || !user.id) return json({ error: '注册失败，未获取到用户信息' }, 500);
 
-    // Create empty profile (must succeed before we consider registration complete)
-    var pfRes = await supabaseREST('fde_profiles', 'POST', {
+    // Create pending profile — FDE card NOT visible until admin approves
+    var pfRes = await supabaseREST('pending_profiles', 'POST', {
       user_id: user.id,
-      name: body.username,
-      email: body.email || '',
-      created_at: now(),
-      updated_at: now()
+      profile_data: {
+        name: body.username,
+        email: body.email || ''
+      },
+      created_at: now()
     }, ['select=id']);
     if (pfRes.error) {
-      // Profile creation failed — clean up the user we just created to avoid orphan accounts
+      // Pending creation failed — clean up the user to avoid orphan accounts
       await supabaseREST('users', 'DELETE', null, ['id=eq.' + user.id]);
       var pfMsg = typeof pfRes.error === 'string' ? pfRes.error : JSON.stringify(pfRes.error);
-      return json({ error: '创建用户资料失败，注册已回滚 - ' + pfMsg }, 500);
+      return json({ error: '创建待审核资料失败，注册已回滚 - ' + pfMsg }, 500);
     }
 
     delete user.password_hash;
@@ -752,18 +753,40 @@ export default async function onRequest(context) {
       var r = await supabaseREST('fde_profiles', 'GET', null, ['select=*', 'user_id=eq.' + fdeUserId]);
       if (r.error) return json({ error: '查询失败' }, 500);
       var data = Array.isArray(r.data) ? r.data[0] : r.data;
-      // Enrich with username/role
+
+      // Get user info for enrichment
+      var uRes = await supabaseREST('users', 'GET', null, ['select=id,username,role', 'id=eq.' + fdeUserId]);
+      var uData = (!uRes.error && uRes.data)
+        ? (Array.isArray(uRes.data) ? uRes.data[0] : uRes.data) : null;
+
+      // Get pending info
+      var pend = await supabaseREST('pending_profiles', 'GET', null, ['select=*', 'user_id=eq.' + fdeUserId]);
+      var pendingData = (!pend.error && pend.data && pend.data.length > 0)
+        ? (Array.isArray(pend.data) ? pend.data[0] : pend.data) : null;
+
       if (data) {
-        var uRes = await supabaseREST('users', 'GET', null, ['select=id,username,role', 'id=eq.' + fdeUserId]);
-        if (!uRes.error && uRes.data) {
-          var uData = Array.isArray(uRes.data) ? uRes.data[0] : uRes.data;
-          if (uData) { data.username = uData.username || ''; data.role = uData.role || 'user'; }
-        }
-        // Check hasPending
-        var pend = await supabaseREST('pending_profiles', 'GET', null, ['select=user_id', 'user_id=eq.' + fdeUserId]);
-        data.hasPending = !pend.error && pend.data && pend.data.length > 0;
+        // Already approved — return live profile
+        if (uData) { data.username = uData.username || ''; data.role = uData.role || 'user'; }
+        data.hasPending = !!pendingData;
+        data.reviewed = true;
+        return json(data);
       }
-      return json(data || null);
+
+      if (pendingData) {
+        // Not yet approved — return pending profile_data as a preview
+        var preview = Object.assign({}, pendingData.profile_data || {});
+        preview.user_id = fdeUserId;
+        preview.reviewed = false;
+        preview.hasPending = true;
+        if (uData) { preview.username = uData.username || ''; preview.role = uData.role || 'user'; }
+        return json(preview);
+      }
+
+      // No profile at all — return basic user info
+      if (uData) {
+        return json({ user_id: fdeUserId, name: '', reviewed: false, hasPending: false, username: uData.username, role: uData.role });
+      }
+      return json(null);
     }
 
     if (method === 'PUT') {
