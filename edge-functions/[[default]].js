@@ -291,7 +291,7 @@ export default async function onRequest(context) {
       status: 'ok', timestamp: now(),
       supabase_url: SB_URL ? 'configured' : 'missing',
       supabase_key: SB_KEY ? 'configured' : 'missing',
-      version: 'edge-v2.3-register-pending-only'
+      version: 'edge-v2.5-admin-delete-user-and-card'
     });
   }
 
@@ -872,6 +872,48 @@ export default async function onRequest(context) {
         if (uData) { result.username = uData.username || ''; result.role = uData.role || 'user'; }
       }
       return json(result);
+    }
+
+    if (method === 'DELETE') {
+      var auth = getAuth();
+      if (!auth) return json({ error: '请先登录' }, 401);
+      if (auth.role !== 'admin') return json({ error: '权限不足，仅管理员可删除FDE卡片' }, 403);
+
+      // Prevent admin from deleting themselves
+      if (auth.id === fdeUserId) {
+        return json({ error: '不能删除自己的账号' }, 400);
+      }
+
+      // 1. Read current profile to get file URLs for cleanup
+      var cur = await supabaseREST('fde_profiles', 'GET', null, ['select=*', 'user_id=eq.' + fdeUserId]);
+      var profileData = (!cur.error && cur.data && cur.data.length > 0)
+        ? (Array.isArray(cur.data) ? cur.data[0] : cur.data) : null;
+
+      var deletedFiles = [];
+
+      if (profileData) {
+        // 2. Delete associated storage files
+        if (profileData.avatar_url) { await deleteFromStorage(profileData.avatar_url); deletedFiles.push(profileData.avatar_url); }
+        if (profileData.wechat_qr_url) { await deleteFromStorage(profileData.wechat_qr_url); deletedFiles.push(profileData.wechat_qr_url); }
+
+        // 3. Delete fde_profiles row
+        var delPr = await supabaseREST('fde_profiles', 'DELETE', null, ['user_id=eq.' + fdeUserId]);
+        if (delPr.error) return json({ error: '删除FDE卡片失败: ' + JSON.stringify(delPr.error) }, 500);
+      }
+
+      // 4. Delete pending_profiles row (if any)
+      await supabaseREST('pending_profiles', 'DELETE', null, ['user_id=eq.' + fdeUserId]);
+
+      // 5. Delete articles authored by this user
+      await supabaseREST('articles', 'DELETE', null, ['author_id=eq.' + fdeUserId]);
+
+      // 6. Delete user account
+      var delUser = await supabaseREST('users', 'DELETE', null, ['id=eq.' + fdeUserId]);
+      if (delUser.error) {
+        return json({ error: 'FDE卡片已删除，但删除用户账号失败: ' + JSON.stringify(delUser.error) }, 500);
+      }
+
+      return json({ message: '用户及FDE卡片已全部删除', deletedFiles: deletedFiles });
     }
   }
 
