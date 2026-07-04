@@ -344,7 +344,9 @@ export default async function onRequest(context) {
     var auth = getAuth();
     if (!auth) return json({ error: '请先登录' }, 401);
     var body = await parseBody();
-    if (!body.currentPassword || !body.newPassword) {
+    // Accept both oldPassword (fed frontend) and currentPassword
+    var oldPwd = body.oldPassword || body.currentPassword;
+    if (!oldPwd || !body.newPassword) {
       return json({ error: '当前密码和新密码不能为空' }, 400);
     }
 
@@ -352,7 +354,7 @@ export default async function onRequest(context) {
     var r = await supabaseREST('users', 'GET', null, ['select=password_hash', 'id=eq.' + auth.id]);
     if (r.error) return json({ error: '查询失败' }, 500);
     var users = Array.isArray(r.data) ? r.data : [r.data];
-    if (users.length === 0 || users[0].password_hash !== hash(body.currentPassword)) {
+    if (users.length === 0 || users[0].password_hash !== hash(oldPwd)) {
       return json({ error: '当前密码不正确' }, 400);
     }
     // Update password
@@ -467,12 +469,12 @@ export default async function onRequest(context) {
         });
       }
     }
-    return json(reviews);
+    return json({ reviews: reviews, count: reviews.length });
   }
 
-  // PUT /api/fde/reviews/:id/approve
+  // POST|PUT /api/fde/reviews/:id/approve
   var approveMatch = path.match(/^\/api\/fde\/reviews\/(\d+)\/approve$/);
-  if (approveMatch && method === 'PUT') {
+  if (approveMatch && (method === 'PUT' || method === 'POST')) {
     var auth = getAuth();
     if (!auth) return json({ error: '请先登录' }, 401);
     if (auth.role !== 'admin') return json({ error: '权限不足' }, 403);
@@ -489,9 +491,9 @@ export default async function onRequest(context) {
     return json({ ok: true });
   }
 
-  // PUT /api/fde/reviews/:id/reject
+  // POST|PUT /api/fde/reviews/:id/reject
   var rejectMatch = path.match(/^\/api\/fde\/reviews\/(\d+)\/reject$/);
-  if (rejectMatch && method === 'PUT') {
+  if (rejectMatch && (method === 'PUT' || method === 'POST')) {
     var auth = getAuth();
     if (!auth) return json({ error: '请先登录' }, 401);
     if (auth.role !== 'admin') return json({ error: '权限不足' }, 403);
@@ -741,9 +743,15 @@ export default async function onRequest(context) {
     return json({ error: 'Edge function 暂不支持文件上传，请使用 Supabase Storage 直传' }, 501);
   }
 
-  // SPA fallback
+  // For /assets/* — let platform serve static files
+  if (path.startsWith('/assets/')) {
+    try { return context.next(); } catch(e) {}
+  }
+
+  // SPA fallback — must include CSS & JS links so React can render pages like /admin
   if (!path.startsWith('/api/')) {
-    return new Response('<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>FDE</title></head><body><div id="root"></div></body></html>', {
+    var SPA_HTML = '<!DOCTYPE html>\n<html lang="zh-CN">\n  <head>\n    <meta charset="UTF-8" />\n    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>🚀</text></svg>" />\n    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n    <link rel="preconnect" href="https://fonts.googleapis.com" />\n    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />\n    <link href="https://fonts.googleapis.com/css2?family=Urbanist:wght@500;600;700&display=swap" rel="stylesheet" />\n    <title>FDE - 前沿部署工程师</title>\n    <script type="module" crossorigin src="/assets/index-B-KrccSR.js"><\/script>\n    <link rel="stylesheet" crossorigin href="/assets/index-mLBsqG2v.css">\n  </head>\n  <body class="bg-gray-50 min-h-screen">\n    <div id="root"></div>\n  </body>\n</html>';
+    return new Response(SPA_HTML, {
       status: 200,
       headers: { 'Content-Type': 'text/html; charset=utf-8' }
     });
